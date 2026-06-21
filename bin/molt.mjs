@@ -10,11 +10,17 @@
 //   molt dashboard                    open the web dashboard
 
 import { readFileSync } from 'node:fs';
-import { resolve } from 'node:path';
+import { fileURLToPath } from 'node:url';
+import { resolve, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
 import { BROKER } from '../src/shared/config.mjs';
 
 const argv = process.argv.slice(2);
+
+function version() {
+  const pkg = JSON.parse(readFileSync(join(dirname(fileURLToPath(import.meta.url)), '..', 'package.json'), 'utf8'));
+  return pkg.version;
+}
 
 function parseFlags(args) {
   const flags = {};
@@ -64,7 +70,18 @@ async function api(method, path, body) {
 
 const [cmd, sub, ...rest] = argv;
 
+if (cmd === '--version' || cmd === '-v') {
+  console.log(version());
+  process.exit(0);
+}
+
 switch (cmd) {
+  case 'doctor': {
+    const { doctor } = await import('../src/doctor.mjs');
+    await doctor();
+    break;
+  }
+
   case 'broker':
     if (sub === 'start') {
       const { startBroker } = await import('../src/broker/server.mjs');
@@ -190,8 +207,9 @@ switch (cmd) {
 }
 
 function usage() {
-  console.log(`molt — Distributed Agent Compute Grid
+  console.log(`molt — Distributed Agent Compute Grid  v${version()}
 
+  molt doctor
   molt broker start
   molt worker start [--adapters mock,codex,claude] [--owner NAME] [--max-slots N] [--trust N]
   molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH]

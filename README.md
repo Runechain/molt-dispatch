@@ -27,11 +27,16 @@ objective  →  plan (job DAG)  →  worker claims  →  codex implements
   - `codex` — `codex login` (ChatGPT account or API). Used for implementation.
 - The `mock` adapter needs nothing and exercises the whole loop with zero AI cost.
 
-Check your logins:
+## Install
 
 ```bash
-claude --version && codex login status
+git clone <this-repo> molt-dispatch && cd molt-dispatch
+npm link            # puts `molt` on your PATH (no dependencies are installed)
+molt doctor         # check Node, git, and which adapters/integrations are ready
 ```
+
+`molt doctor` tells you exactly what's available and what to log into. You can also run it
+without installing as `node bin/molt.mjs <cmd>`.
 
 ## Quick start (zero-cost mock loop)
 
