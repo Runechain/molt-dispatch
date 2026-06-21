@@ -44,17 +44,17 @@ Three terminals (or background the broker):
 
 ```bash
 # 1. start the control plane
-node bin/molt.mjs broker start
+molt broker start
 
 # 2. create + plan an objective
-node bin/molt.mjs objective create "Add a waitlist endpoint" --prompt "POST /api/waitlist"
+molt objective create "Add a waitlist endpoint" --prompt "POST /api/waitlist"
 
 # 3. run a worker that drains the queue (no AI, no cost)
-node bin/molt.mjs worker start --adapters mock
+molt worker start --adapters mock
 
 # watch it
-node bin/molt.mjs status
-node bin/molt.mjs approve O-01
+molt status
+molt approve O-01
 ```
 
 ## The "hello world of the grid" (real agents)
@@ -64,14 +64,14 @@ until the tests pass, **Claude reviews** the diff, the broker runs `npm test` it
 on success the objective becomes approvable.
 
 ```bash
-node bin/molt.mjs broker start            # terminal 1
-node bin/molt.mjs objective create -f examples/waitlist-objective.json
-node bin/molt.mjs worker start --adapters codex,claude   # terminal 2
+molt broker start            # terminal 1
+molt objective create -f examples/waitlist-objective.json
+molt worker start --adapters codex,claude   # terminal 2
 
-node bin/molt.mjs dashboard               # open the web UI
-node bin/molt.mjs status                  # or watch from the CLI
+molt dashboard               # open the web UI
+molt status                  # or watch from the CLI
 # when O-01 is ready_for_approval:
-node bin/molt.mjs approve O-01            # merges grid/J-0001 into the example repo's main
+molt approve O-01            # merges grid/J-0001 into the example repo's main
 ```
 
 There are **no midstream human questions** — the human only defines the objective + its
