@@ -158,7 +158,7 @@ function createObjective(body) {
   return createObjectiveRow(body);
 }
 
-function createObjectiveRow(body) {
+async function createObjectiveRow(body) {
   const d = getDb();
   const id = mkObjectiveId(nextSeq('objective'));
   const contract = body.contract || {};
@@ -181,7 +181,7 @@ function createObjectiveRow(body) {
   logEvent('objective', id, 'created', { title: body.title, source_issue: body.source_issue });
 
   const objective = parseRow(d.prepare('SELECT * FROM objectives WHERE id=?').get(id), ['contract_json']);
-  const jobs = planObjective(objective);
+  const jobs = await planObjective(objective);
   d.prepare('UPDATE objectives SET status=?, updated_at=? WHERE id=?').run('in_progress', now(), id);
   return { objective_id: id, jobs };
 }
@@ -201,7 +201,7 @@ async function importIssues(body) {
       skipped.push({ issue: issue.number, objective: exists.id });
       continue;
     }
-    const out = createObjectiveRow({
+    const out = await createObjectiveRow({
       title: `#${issue.number} ${issue.title}`,
       prompt: issue.body || issue.title,
       repo: body.repo,
@@ -310,7 +310,7 @@ export function startBroker() {
         const r = await submitResult(resultMatch[1], await readBody(req));
         return json(res, r.code || 200, r);
       }
-      if (method === 'POST' && path === '/objectives') return json(res, 200, createObjective(await readBody(req)));
+      if (method === 'POST' && path === '/objectives') return json(res, 200, await createObjective(await readBody(req)));
       if (method === 'POST' && path === '/github/import-issues') {
         const r = await importIssues(await readBody(req));
         return json(res, r.code || 200, r);

@@ -118,6 +118,7 @@ switch (cmd) {
           branch_base: flags.base || undefined,
         };
       }
+      if (flags.plan) payload.contract = { ...(payload.contract || {}), planner: flags.plan };
       if (!payload.title) {
         console.error('objective needs a title (positional or in the -f file)');
         process.exit(1);
@@ -212,7 +213,7 @@ function usage() {
   molt doctor
   molt broker start
   molt worker start [--adapters mock,codex,claude] [--owner NAME] [--max-slots N] [--trust N]
-  molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH]
+  molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH] [--plan llm]
   molt objective create -f <spec.json>
   molt github import-issues --repo <path> [--label L] [--limit N] [--test "npm test"]
   molt approve <objective-id>        (github repo -> opens a PR; local repo -> merges)

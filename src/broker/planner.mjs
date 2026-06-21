@@ -1,14 +1,43 @@
-// Planner: objective -> job DAG. v1 is template-based and deterministic (no LLM, no cost).
-// Pluggable: a claude-backed planner emitting PLAN_SCHEMA can drop in later behind plan().
+// Planner: objective -> job DAG.
+//
+// Two planners, selected by contract.planner ('template' default, or 'llm'):
+//   - template : deterministic, zero-cost. code.feature -> implement -> review.
+//   - llm      : claude decomposes an arbitrary objective into a DAG (PLAN_SCHEMA),
+//                with the template as a safety-net fallback if it fails or is malformed.
 
 import { getDb, now, nextSeq, logEvent, transaction } from './db.mjs';
 import { jobId } from '../shared/ids.mjs';
+import { run } from '../shared/proc.mjs';
+import { extractJson } from '../shared/jsonout.mjs';
+import { PLAN_SCHEMA, validateAgainst } from '../shared/schema.mjs';
 
-// Built-in templates keyed by objective type. Each returns plan jobs with local `key`s
-// and `depends_on` referencing other keys in the same plan.
+// Capabilities the grid can currently schedule, and which adapter serves each.
+const CAPABILITIES = {
+  'code.implementation': 'codex',
+  'tests.unit': 'codex',
+  'code.review': 'claude',
+  'docs.technical': 'claude',
+  'product.specification': 'claude',
+};
+
+export async function planObjective(objective) {
+  const mode = objective.contract?.planner || 'template';
+  let planned;
+  if (mode === 'llm') {
+    planned = await planWithClaude(objective);
+    if (!planned || !planned.length) {
+      logEvent('objective', objective.id, 'planner_fallback', { reason: 'llm planner failed; using template' });
+      planned = templatePlan(objective);
+    }
+  } else {
+    planned = templatePlan(objective);
+  }
+  return materialize(objective, planned);
+}
+
+// ---- Template planner --------------------------------------------------------
+
 const TEMPLATES = {
-  // The whitepaper "hello world of the grid": implement, then review. Tests run inside
-  // validation, so there's no separate test job — the impl branch is validated in place.
   'code.feature': (obj, contract) => [
     {
       key: 'impl',
@@ -17,15 +46,7 @@ const TEMPLATES = {
       capability: 'code.implementation',
       adapter_hint: 'codex',
       prompt: implPrompt(obj, contract),
-      spec: {
-        acceptance_criteria: contract.hard_completion_gates || [],
-        constraints: {
-          max_files_changed: contract.constraints?.max_files_changed ?? 12,
-          forbidden: contract.forbidden_without_approval || [],
-          protected_paths: contract.protected_paths || [],
-        },
-        validation: contract.validation || {},
-      },
+      spec: implSpec(contract),
       depends_on: [],
     },
     {
@@ -40,6 +61,24 @@ const TEMPLATES = {
     },
   ],
 };
+
+function templatePlan(objective) {
+  const contract = objective.contract || {};
+  const template = TEMPLATES[objectiveType(objective)] || TEMPLATES['code.feature'];
+  return template(objective, contract);
+}
+
+function implSpec(contract) {
+  return {
+    acceptance_criteria: contract.hard_completion_gates || [],
+    constraints: {
+      max_files_changed: contract.constraints?.max_files_changed ?? 12,
+      forbidden: contract.forbidden_without_approval || [],
+      protected_paths: contract.protected_paths || [],
+    },
+    validation: contract.validation || {},
+  };
+}
 
 function implPrompt(obj, contract) {
   const gates = (contract.hard_completion_gates || []).map((g) => `  - ${g}`).join('\n');
@@ -67,13 +106,72 @@ function reviewPrompt(obj, contract) {
   ].join('\n');
 }
 
-// Materialize the plan into jobs + dependencies. Jobs start 'blocked' unless they have
-// no deps, in which case they go straight to 'pending' and can be claimed.
-export function planObjective(objective) {
-  const contract = objective.contract || {};
-  const template = TEMPLATES[objectiveType(objective)] || TEMPLATES['code.feature'];
-  const planned = template(objective, contract);
+// ---- LLM planner -------------------------------------------------------------
 
+async function planWithClaude(objective) {
+  const contract = objective.contract || {};
+  const prompt = plannerPrompt(objective);
+  const res = await run(
+    'claude',
+    ['-p', prompt, '--output-format', 'json', '--permission-mode', 'bypassPermissions', '--allowedTools', ''],
+    { timeoutMs: 5 * 60 * 1000 }
+  );
+  if (res.code !== 0) return null;
+
+  let envelope;
+  try {
+    envelope = JSON.parse(res.stdout);
+  } catch {
+    return null;
+  }
+  const plan = extractJson(envelope.result);
+  const check = validateAgainst(PLAN_SCHEMA, plan);
+  if (!check.valid) {
+    logEvent('objective', objective.id, 'planner_invalid', { errors: check.errors.slice(0, 5) });
+    return null;
+  }
+
+  // Map planned jobs to internal form; drop jobs with capabilities we can't schedule.
+  const planned = [];
+  for (const j of plan.jobs.slice(0, 8)) {
+    if (!CAPABILITIES[j.capability]) continue;
+    const isImpl = j.capability === 'code.implementation' || j.capability === 'tests.unit';
+    planned.push({
+      key: j.key,
+      type: j.type || (isImpl ? 'code.implementation' : 'code.review'),
+      title: j.title,
+      capability: j.capability,
+      adapter_hint: CAPABILITIES[j.capability],
+      prompt: j.prompt || j.title,
+      spec: isImpl ? implSpec(contract) : { rubric: j.capability === 'code.review' },
+      depends_on: (j.depends_on || []).filter((k) => plan.jobs.some((x) => x.key === k)),
+    });
+  }
+  return planned.length ? planned : null;
+}
+
+function plannerPrompt(objective) {
+  const caps = Object.entries(CAPABILITIES).map(([c, a]) => `  - ${c} (adapter: ${a})`).join('\n');
+  return [
+    `Decompose this objective into a SMALL dependency graph (2-5) of bounded work units.`,
+    `\nObjective: "${objective.title}"`,
+    objective.prompt ? `Detail: ${objective.prompt}` : '',
+    `\nAvailable capabilities (use ONLY these):\n${caps}`,
+    `\nRules:`,
+    `  - Implementation work uses capability "code.implementation".`,
+    `  - Every implementation job should be followed by a "code.review" job that depends on it.`,
+    `  - Keep each unit small and independently checkable. Use depends_on to serialize where needed.`,
+    `\nRespond with ONLY a JSON object (no prose, no fences):`,
+    `{"jobs":[{"key":"impl","type":"code.implementation","title":"...","capability":"code.implementation","prompt":"detailed instructions","depends_on":[]},`,
+    ` {"key":"review","type":"code.review","title":"...","capability":"code.review","prompt":"what to check","depends_on":["impl"]}]}`,
+  ]
+    .filter(Boolean)
+    .join('\n');
+}
+
+// ---- Materialize plan -> jobs + dependencies ---------------------------------
+
+function materialize(objective, planned) {
   const d = getDb();
   const keyToId = {};
   const created = [];
@@ -86,9 +184,7 @@ export function planObjective(objective) {
            @trust_required,@adapter_hint,@spec_json,@status,@priority,
            @estimated_minutes,0,@ts,@ts)
   `);
-  const insertDep = d.prepare(
-    'INSERT INTO job_dependencies(job_id, depends_on_job_id) VALUES(?, ?)'
-  );
+  const insertDep = d.prepare('INSERT INTO job_dependencies(job_id, depends_on_job_id) VALUES(?, ?)');
 
   transaction(() => {
     for (const p of planned) {
@@ -115,7 +211,7 @@ export function planObjective(objective) {
     }
     for (const p of planned) {
       for (const depKey of p.depends_on || []) {
-        insertDep.run(keyToId[p.key], keyToId[depKey]);
+        if (keyToId[depKey]) insertDep.run(keyToId[p.key], keyToId[depKey]);
       }
     }
   });
