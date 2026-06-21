@@ -31,7 +31,7 @@ function parseFlags(args) {
         i++;
       }
     } else if (a.startsWith('-') && a.length === 2) {
-      const key = a;
+      const key = a.slice(1); // '-f' -> 'f'
       const next = args[i + 1];
       flags[key] = next;
       i++;

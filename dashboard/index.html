@@ -1,0 +1,35 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <meta name="viewport" content="width=device-width, initial-scale=1" />
+    <title>molt · grid dispatch</title>
+    <link rel="stylesheet" href="/dashboard/style.css" />
+  </head>
+  <body>
+    <header>
+      <div class="brand">
+        <span class="logo">▰▰▱</span>
+        <h1>molt <span class="dim">· distributed agent compute grid</span></h1>
+      </div>
+      <div class="status" id="broker-status"><span class="dot"></span> connecting…</div>
+    </header>
+
+    <main>
+      <section class="col col-wide">
+        <h2>Objectives</h2>
+        <div id="objectives" class="stack"></div>
+      </section>
+
+      <section class="col">
+        <h2>Workers</h2>
+        <div id="workers" class="stack"></div>
+
+        <h2>Event feed</h2>
+        <div id="events" class="feed"></div>
+      </section>
+    </main>
+
+    <script src="/dashboard/app.js"></script>
+  </body>
+</html>

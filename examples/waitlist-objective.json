@@ -1,0 +1,24 @@
+{
+  "title": "Implement the waitlist addEmail function",
+  "prompt": "Implement addEmail(email, store) in src/waitlist.js so the tests in test/ pass. Validate the email format and throw on an invalid address; dedupe so the same email is never added twice (return { added: false, reason: 'duplicate' }); on success push the email and return { added: true }.",
+  "repo": "./target-repo",
+  "branch_base": "main",
+  "contract": {
+    "objective_type": "code.feature",
+    "hard_completion_gates": [
+      "src/waitlist.js implements addEmail",
+      "the test suite (node --test) passes"
+    ],
+    "forbidden_without_approval": [
+      "modifying any file under test/",
+      "adding npm dependencies"
+    ],
+    "constraints": { "max_files_changed": 3 },
+    "protected_paths": ["test/"],
+    "validation": { "automated": ["npm test"] },
+    "quality_thresholds": {
+      "implementation_review_score_min": 0.7,
+      "confidence_min": 0.6
+    }
+  }
+}

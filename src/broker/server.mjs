@@ -89,6 +89,21 @@ function claim(body) {
   const spec = job.spec_json ? JSON.parse(job.spec_json) : {};
   logEvent('job', job.id, 'claimed', { worker: worker.id });
 
+  // For dependent jobs (e.g. review), point at the dependency's branch + patch artifact
+  // so the worker can check it out / read the diff.
+  let review_target = null;
+  const deps = d.prepare('SELECT depends_on_job_id FROM job_dependencies WHERE job_id=?').all(job.id);
+  if (deps.length) {
+    const depJob = d.prepare('SELECT * FROM jobs WHERE id=?').get(deps[0].depends_on_job_id);
+    if (depJob) {
+      review_target = {
+        job_id: depJob.id,
+        branch: depJob.branch,
+        patch_path: join(PATHS.artifacts, depJob.id, 'patch.diff'),
+      };
+    }
+  }
+
   return {
     job: {
       job_id: job.id,
@@ -106,6 +121,7 @@ function claim(body) {
       branch,
       acceptance_criteria: spec.acceptance_criteria || [],
       worktree: join(PATHS.worktrees, job.id),
+      review_target,
     },
   };
 }

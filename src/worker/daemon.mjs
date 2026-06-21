@@ -140,7 +140,11 @@ async function executeJob(job, enabledNames, myId) {
     await submit(job, { lease_token: job.lease_token, status: 'failed', error: String(err?.message || err) });
     console.error(`[worker] ${job.job_id} failed:`, err?.message || err);
   } finally {
-    if (workspace?.cleanup) await workspace.cleanup().catch(() => {});
+    // Implementation worktrees are kept so the broker can run static/automated validation
+    // against them and merge on approval; the broker removes them later. Other jobs
+    // (e.g. review) own their worktree and clean it up here.
+    const brokerOwnsWorktree = job.type === 'code.implementation';
+    if (workspace?.cleanup && !brokerOwnsWorktree) await workspace.cleanup().catch(() => {});
   }
 }
 

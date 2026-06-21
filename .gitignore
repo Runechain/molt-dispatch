@@ -3,6 +3,9 @@
 /artifacts/
 /worktrees/
 
+# Isolated codex config home for grid runs (contains symlinked auth)
+/.codex-grid-home/
+
 # Node
 node_modules/
 npm-debug.log*

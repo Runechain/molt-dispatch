@@ -22,6 +22,7 @@ const TEMPLATES = {
         constraints: {
           max_files_changed: contract.constraints?.max_files_changed ?? 12,
           forbidden: contract.forbidden_without_approval || [],
+          protected_paths: contract.protected_paths || [],
         },
         validation: contract.validation || {},
       },
