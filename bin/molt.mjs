@@ -113,6 +113,32 @@ switch (cmd) {
     usage();
     break;
 
+  case 'github':
+    if (sub === 'import-issues') {
+      const { flags } = parseFlags(rest);
+      if (!flags.repo) {
+        console.error('usage: molt github import-issues --repo <path> [--label L] [--limit N] [--test "npm test"]');
+        process.exit(1);
+      }
+      const out = await api('POST', '/github/import-issues', {
+        repo: resolve(process.cwd(), flags.repo),
+        label: flags.label,
+        limit: flags.limit ? Number(flags.limit) : undefined,
+        base: flags.base,
+        test: flags.test,
+      });
+      if (out.error) {
+        console.error(`import failed: ${out.error}`);
+        process.exit(1);
+      }
+      console.log(`Imported from ${out.slug}: ${out.created.length} new, ${out.skipped.length} skipped`);
+      for (const c of out.created) console.log(`  #${c.issue} -> ${c.objective_id} (${c.jobs.length} jobs)`);
+      for (const s of out.skipped) console.log(`  #${s.issue} already imported as ${s.objective}`);
+      break;
+    }
+    usage();
+    break;
+
   case 'approve': {
     const id = sub;
     if (!id) {
@@ -121,7 +147,10 @@ switch (cmd) {
     }
     const out = await api('POST', `/objectives/${id}/approve`);
     if (out.error) console.error(`approve failed: ${out.error}`);
-    else console.log(`Objective ${id} -> ${out.status}`);
+    else {
+      console.log(`Objective ${id} -> ${out.status} (${out.mode || 'merge'})`);
+      if (out.pr_url) console.log(`PR: ${out.pr_url}`);
+    }
     break;
   }
 
@@ -131,6 +160,7 @@ switch (cmd) {
     console.log('OBJECTIVES');
     for (const o of objectives) {
       console.log(`  ${o.id}  [${o.status}]  ${o.title}`);
+      if (o.pr_url) console.log(`      PR: ${o.pr_url}`);
       if (!sub || sub === o.id) {
         const jobs = await api('GET', `/jobs?objective=${o.id}`);
         for (const j of jobs) {
@@ -166,7 +196,8 @@ function usage() {
   molt worker start [--adapters mock,codex,claude] [--owner NAME] [--max-slots N] [--trust N]
   molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH]
   molt objective create -f <spec.json>
-  molt approve <objective-id>
+  molt github import-issues --repo <path> [--label L] [--limit N] [--test "npm test"]
+  molt approve <objective-id>        (github repo -> opens a PR; local repo -> merges)
   molt status [objective-id]
   molt dashboard
 `);

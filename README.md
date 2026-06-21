@@ -72,6 +72,28 @@ node bin/molt.mjs approve O-01            # merges grid/J-0001 into the example 
 There are **no midstream human questions** — the human only defines the objective + its
 completion contract up front, and approves the merge at the end.
 
+## GitHub mode
+
+If an objective's repo is a GitHub clone (an `origin` pointing at github.com) and `gh` is
+logged in, the grid integrates via **pull request** instead of a local merge — the final
+merge decision stays with you on GitHub. Uses your local `gh` auth; the token never leaves
+your machine.
+
+```bash
+# turn open GitHub issues into objectives (one per issue), deduped by issue number
+node bin/molt.mjs github import-issues --repo ~/code/my-repo --test "npm test" [--label grid] [--limit 20]
+
+node bin/molt.mjs worker start --adapters codex,claude
+
+# approve -> assembles a grid/O-## branch, pushes it, opens a PR whose body is the
+# implementation summary + Claude's review rubric (and "Closes #<issue>")
+node bin/molt.mjs approve O-01
+```
+
+Integration mode auto-detects (PR for GitHub repos, local merge otherwise). Force it with
+`"integration": "pr"` or `"merge"` in the objective's contract. The default is intentionally
+**PR, not push-to-main**, so a human always makes the merge call.
+
 ## Commands
 
 ```
@@ -97,7 +119,8 @@ molt dashboard                                  open the web dashboard
 | Worker daemon (register/heartbeat/claim/submit) | `src/worker/daemon.mjs` | §5 |
 | Git-worktree isolation | `src/worker/workspace.mjs` | §10 |
 | Adapters (mock / codex / claude) | `src/worker/adapters/` | §4 |
-| Human approval + merge | `src/broker/broker-ops.mjs` | §9 |
+| Human approval + merge / PR | `src/broker/broker-ops.mjs` | §9 |
+| GitHub integration (issues, PRs) | `src/broker/gh.mjs` | §9, §13 |
 | Data model (SQLite) | `src/broker/db.mjs` | §11 |
 
 ### The completion contract

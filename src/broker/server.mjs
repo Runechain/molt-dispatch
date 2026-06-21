@@ -12,6 +12,7 @@ import { pickJob } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
 import { reputationFor } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
+import { listIssues } from './gh.mjs';
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'content-type': 'application/json' });
@@ -154,12 +155,16 @@ async function submitResult(jobId, body) {
 }
 
 function createObjective(body) {
+  return createObjectiveRow(body);
+}
+
+function createObjectiveRow(body) {
   const d = getDb();
   const id = mkObjectiveId(nextSeq('objective'));
   const contract = body.contract || {};
   d.prepare(
-    `INSERT INTO objectives(id, title, prompt, repo, branch_base, contract_json, status, created_by, created_at, updated_at)
-     VALUES(?,?,?,?,?,?,?,?,?,?)`
+    `INSERT INTO objectives(id, title, prompt, repo, branch_base, contract_json, status, created_by, source_issue, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?)`
   ).run(
     id,
     body.title,
@@ -169,15 +174,56 @@ function createObjective(body) {
     JSON.stringify(contract),
     'planning',
     body.created_by || 'cli',
+    body.source_issue ?? null,
     now(),
     now()
   );
-  logEvent('objective', id, 'created', { title: body.title });
+  logEvent('objective', id, 'created', { title: body.title, source_issue: body.source_issue });
 
   const objective = parseRow(d.prepare('SELECT * FROM objectives WHERE id=?').get(id), ['contract_json']);
   const jobs = planObjective(objective);
   d.prepare('UPDATE objectives SET status=?, updated_at=? WHERE id=?').run('in_progress', now(), id);
   return { objective_id: id, jobs };
+}
+
+// Import open GitHub issues as objectives (one per issue), deduped by issue number.
+async function importIssues(body) {
+  if (!body.repo) return { error: 'repo path required', code: 400 };
+  const res = await listIssues({ repo: body.repo, label: body.label, limit: body.limit });
+  if (res.error) return { error: res.error, code: 400 };
+
+  const d = getDb();
+  const created = [];
+  const skipped = [];
+  for (const issue of res.issues) {
+    const exists = d.prepare('SELECT id FROM objectives WHERE source_issue=?').get(issue.number);
+    if (exists) {
+      skipped.push({ issue: issue.number, objective: exists.id });
+      continue;
+    }
+    const out = createObjectiveRow({
+      title: `#${issue.number} ${issue.title}`,
+      prompt: issue.body || issue.title,
+      repo: body.repo,
+      branch_base: body.base || 'main',
+      contract: defaultIssueContract(body.test),
+      created_by: 'github-issue',
+      source_issue: issue.number,
+    });
+    created.push({ issue: issue.number, ...out });
+  }
+  return { slug: res.slug, created, skipped };
+}
+
+function defaultIssueContract(testCmd) {
+  return {
+    objective_type: 'code.feature',
+    hard_completion_gates: testCmd ? [`'${testCmd}' passes`] : ['implements the change described in the issue'],
+    forbidden_without_approval: ['adding npm dependencies'],
+    constraints: { max_files_changed: 20 },
+    validation: testCmd ? { automated: [testCmd] } : {},
+    quality_thresholds: { implementation_review_score_min: 0.7, confidence_min: 0.6 },
+  };
 }
 
 // ---- Read endpoints (dashboard / CLI status) ---------------------------------
@@ -265,6 +311,10 @@ export function startBroker() {
         return json(res, r.code || 200, r);
       }
       if (method === 'POST' && path === '/objectives') return json(res, 200, createObjective(await readBody(req)));
+      if (method === 'POST' && path === '/github/import-issues') {
+        const r = await importIssues(await readBody(req));
+        return json(res, r.code || 200, r);
+      }
       const approveMatch = path.match(/^\/objectives\/([^/]+)\/approve$/);
       if (method === 'POST' && approveMatch) return json(res, 200, await approveObjective(approveMatch[1]));
 

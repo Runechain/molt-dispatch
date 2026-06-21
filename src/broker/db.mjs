@@ -15,7 +15,15 @@ export function getDb() {
   db.exec('PRAGMA journal_mode = WAL;');
   db.exec('PRAGMA foreign_keys = ON;');
   bootstrap(db);
+  migrate(db);
   return db;
+}
+
+// Add columns to pre-existing databases (node:sqlite has no IF NOT EXISTS for columns).
+function migrate(d) {
+  const cols = d.prepare('PRAGMA table_info(objectives)').all().map((c) => c.name);
+  if (!cols.includes('source_issue')) d.exec('ALTER TABLE objectives ADD COLUMN source_issue INTEGER');
+  if (!cols.includes('pr_url')) d.exec('ALTER TABLE objectives ADD COLUMN pr_url TEXT');
 }
 
 function bootstrap(d) {
@@ -34,6 +42,8 @@ function bootstrap(d) {
       contract_json TEXT,            -- completion contract (§12)
       status TEXT NOT NULL DEFAULT 'planning',
       created_by TEXT,
+      source_issue INTEGER,          -- GitHub issue number this objective came from
+      pr_url TEXT,                   -- PR opened on approval (github mode)
       created_at INTEGER NOT NULL,
       updated_at INTEGER NOT NULL
     );
