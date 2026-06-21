@@ -1,0 +1,14 @@
+# Runtime state — never committed
+/data/
+/artifacts/
+/worktrees/
+
+# Node
+node_modules/
+npm-debug.log*
+
+# OS
+.DS_Store
+
+# Keep the example target repo's own .git out of this repo (it's a nested demo repo)
+/examples/target-repo/

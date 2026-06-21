@@ -1,0 +1,19 @@
+{
+  "name": "molt-dispatch",
+  "version": "0.1.0",
+  "description": "A local-install Distributed Agent Compute Grid (DACG) — a pull-based broker that decomposes objectives into bounded work units, dispatches them to heterogeneous AI workers (Claude, Codex), validates results, and recomposes accepted artifacts.",
+  "type": "module",
+  "bin": {
+    "molt": "bin/molt.mjs"
+  },
+  "engines": {
+    "node": ">=24"
+  },
+  "scripts": {
+    "broker": "node bin/molt.mjs broker start",
+    "worker": "node bin/molt.mjs worker start",
+    "dashboard": "node bin/molt.mjs dashboard"
+  },
+  "license": "AGPL-3.0-or-later",
+  "private": true
+}
