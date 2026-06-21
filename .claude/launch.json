@@ -1,0 +1,11 @@
+{
+  "version": "0.0.1",
+  "configurations": [
+    {
+      "name": "molt-broker",
+      "runtimeExecutable": "node",
+      "runtimeArgs": ["bin/molt.mjs", "broker", "start"],
+      "port": 7077
+    }
+  ]
+}
