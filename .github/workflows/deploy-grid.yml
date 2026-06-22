@@ -99,50 +99,56 @@ jobs:
           echo "$PATCHED" > /tmp/task-def.json
           echo "definition=/tmp/task-def.json" >> $GITHUB_OUTPUT
 
-      - name: Register + deploy ECS task definition
-        uses: aws-actions/amazon-ecs-deploy-task-definition@v1
-        with:
-          task-definition: ${{ steps.task-def-rendered.outputs.definition }}
-          service:         ${{ env.ECS_SERVICE }}
-          cluster:         ${{ env.ECS_CLUSTER }}
-          wait-for-service-stability: true
-
-      - name: Create ECS service if missing
+      - name: Register task definition, create or update ECS service
         run: |
+          # Register the patched task definition
+          TD_ARN=$(aws ecs register-task-definition \
+            --cli-input-json file://${{ steps.task-def-rendered.outputs.definition }} \
+            --query 'taskDefinition.taskDefinitionArn' --output text)
+          echo "Registered task definition: $TD_ARN"
+
+          # Check if the service exists
           STATUS=$(aws ecs describe-services \
             --cluster  $ECS_CLUSTER \
             --services $ECS_SERVICE \
             --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
+
           if [ "$STATUS" = "ACTIVE" ]; then
-            echo "Service already active — deploy step updated it."
-            exit 0
+            echo "Service active — updating task definition..."
+            aws ecs update-service \
+              --cluster        $ECS_CLUSTER \
+              --service        $ECS_SERVICE \
+              --task-definition "$TD_ARN" \
+              --force-new-deployment
+          else
+            echo "Service missing — creating $ECS_SERVICE..."
+            VPC=$(aws ec2 describe-vpcs \
+              --filters Name=isDefault,Values=true \
+              --query 'Vpcs[0].VpcId' --output text)
+            SUBNETS=$(aws ec2 describe-subnets \
+              --filters "Name=vpc-id,Values=$VPC" \
+              --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
+            SG=$(aws ec2 describe-security-groups \
+              --filters "Name=group-name,Values=molt-broker-sg" "Name=vpc-id,Values=$VPC" \
+              --query 'SecurityGroups[0].GroupId' --output text)
+            TG=$(aws elbv2 describe-target-groups \
+              --names molt-broker-tg \
+              --query 'TargetGroups[0].TargetGroupArn' --output text)
+            aws ecs create-service \
+              --cluster $ECS_CLUSTER \
+              --service-name $ECS_SERVICE \
+              --task-definition "$TD_ARN" \
+              --desired-count 1 \
+              --launch-type FARGATE \
+              --health-check-grace-period-seconds 60 \
+              --load-balancers "targetGroupArn=$TG,containerName=$CONTAINER_NAME,containerPort=7077" \
+              --network-configuration \
+                "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}"
           fi
-          echo "Creating ECS service $ECS_SERVICE…"
-          VPC=$(aws ec2 describe-vpcs \
-            --filters Name=isDefault,Values=true \
-            --query 'Vpcs[0].VpcId' --output text)
-          SUBNETS=$(aws ec2 describe-subnets \
-            --filters Name=vpc-id,Values=$VPC \
-            --query 'Subnets[].SubnetId' --output text | tr '\t' ',')
-          SG=$(aws ec2 describe-security-groups \
-            --filters Name=group-name,Values=molt-broker-sg Name=vpc-id,Values=$VPC \
-            --query 'SecurityGroups[0].GroupId' --output text)
-          TG=$(aws elbv2 describe-target-groups \
-            --names molt-broker-tg \
-            --query 'TargetGroups[0].TargetGroupArn' --output text)
-          TD=$(aws ecs register-task-definition \
-            --cli-input-json file://${{ steps.task-def-rendered.outputs.definition }} \
-            --query 'taskDefinition.taskDefinitionArn' --output text)
-          aws ecs create-service \
-            --cluster $ECS_CLUSTER \
-            --service-name $ECS_SERVICE \
-            --task-definition "$TD" \
-            --desired-count 1 \
-            --launch-type FARGATE \
-            --health-check-grace-period-seconds 60 \
-            --load-balancers "targetGroupArn=$TG,containerName=$CONTAINER_NAME,containerPort=7077" \
-            --network-configuration \
-              "awsvpcConfiguration={subnets=[$SUBNETS],securityGroups=[$SG],assignPublicIp=ENABLED}"
+
+          echo "Waiting for service stability..."
+          aws ecs wait services-stable --cluster $ECS_CLUSTER --services $ECS_SERVICE
+          echo "Service is stable."
 
       - name: Smoke test broker health
         run: |
