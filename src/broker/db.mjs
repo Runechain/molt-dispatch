@@ -21,9 +21,48 @@ export function getDb() {
 
 // Add columns to pre-existing databases (node:sqlite has no IF NOT EXISTS for columns).
 function migrate(d) {
-  const cols = d.prepare('PRAGMA table_info(objectives)').all().map((c) => c.name);
-  if (!cols.includes('source_issue')) d.exec('ALTER TABLE objectives ADD COLUMN source_issue INTEGER');
-  if (!cols.includes('pr_url')) d.exec('ALTER TABLE objectives ADD COLUMN pr_url TEXT');
+  const addCol = (table, col, ddl) => {
+    const cols = d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(col)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  };
+  addCol('objectives', 'source_issue', 'source_issue INTEGER');
+  addCol('objectives', 'pr_url', 'pr_url TEXT');
+  // Redundant verify: set when a low-rep worker's result needs a secondary check before approve.
+  addCol('objectives', 'needs_review', 'needs_review INTEGER NOT NULL DEFAULT 0');
+  // Heterogeneous reputation: per (worker, capability, model/provider).
+  addCol('reputation_events', 'model', 'model TEXT');
+  addCol('reputation_events', 'provider', 'provider TEXT');
+  // Fault tolerance: remember who dropped a job so continuation avoids re-handing it.
+  addCol('jobs', 'last_failed_worker_id', 'last_failed_worker_id TEXT');
+  addCol('jobs', 'checkpoint_seq', 'checkpoint_seq INTEGER DEFAULT 0');
+  // Ensure the primary team account exists for the fuel ledger.
+  ensurePrimaryAccount(d);
+  // Seed cost model with known Bedrock pricing (INSERT OR IGNORE).
+  seedCostModel(d);
+}
+
+function ensurePrimaryAccount(d) {
+  d.prepare(
+    `INSERT INTO accounts(id, name, role, balance_cents, status, created_at)
+     VALUES(?,?,?,?,?,?)
+     ON CONFLICT(id) DO NOTHING`
+  ).run('acct_primary', 'Team (primary)', 'team', 0, 'active', Date.now());
+}
+
+function seedCostModel(d) {
+  const ins = d.prepare(
+    `INSERT OR IGNORE INTO cost_model(id, provider, model, input_cents_per_1k, output_cents_per_1k, flat_cents, created_at)
+     VALUES(?,?,?,?,?,?,?)`
+  );
+  const t = Date.now();
+  // Bedrock prices (USD per 1M tokens → cents per 1k tokens):
+  //   claude-3-haiku:   $0.25/1M in  $1.25/1M out  → 0.025 / 0.125 cents per 1k
+  //   claude-sonnet:    $3.00/1M in  $15.00/1M out  → 0.3   / 1.5   cents per 1k
+  ins.run('cm_haiku',    'bedrock', 'claude-3-haiku',                              0.025, 0.125, 0, t);
+  ins.run('cm_haiku3v',  'bedrock', 'anthropic.claude-3-haiku-20240307-v1:0',      0.025, 0.125, 0, t);
+  ins.run('cm_sonnet46', 'bedrock', 'anthropic.claude-sonnet-4-6',                 0.3,   1.5,   0, t);
+  ins.run('cm_local',    'local',   '*',                                            0,     0,     0, t);
+  ins.run('cm_mock',     'mock',    'mock-1',                                       0,     0,     0, t);
 }
 
 function bootstrap(d) {
@@ -137,6 +176,63 @@ function bootstrap(d) {
       event_type TEXT NOT NULL,
       payload_json TEXT,
       created_at INTEGER NOT NULL
+    );
+
+    -- Partial progress so a dropped job can be RESUMED, not restarted (fault tolerance).
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES jobs(id),
+      worker_id TEXT,
+      seq INTEGER NOT NULL DEFAULT 0,   -- monotonic per job; latest wins on requeue
+      state_json TEXT NOT NULL,         -- adapter-defined partial-progress payload
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Team-gating + (Phase 2) fuel budget. Balance is in USDC cents; simulated until MOLT_FUEL_REAL=1.
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      role TEXT NOT NULL DEFAULT 'team',   -- team|worker|consumer
+      balance_cents INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,                 -- public part (mk_...), sent with the secret as id.secret
+      account_id TEXT REFERENCES accounts(id),
+      hash TEXT NOT NULL,                  -- sha256(secret); the raw secret is never stored
+      name TEXT,
+      scopes TEXT NOT NULL DEFAULT 'dispatch,worker',  -- csv: dispatch|worker|approve|admin
+      last_used INTEGER,
+      revoked INTEGER NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Fuel ledger: every reserve/charge/refund/credit/payout in one append-only log.
+    -- amount_cents > 0 = inflow (credit/refund), amount_cents < 0 = outflow (reserve/charge/payout).
+    -- Balance = SUM(amount_cents) per account.
+    CREATE TABLE IF NOT EXISTS fuel_ledger (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts(id),
+      job_id TEXT REFERENCES jobs(id),
+      op TEXT NOT NULL,         -- reserve|charge|refund|credit|payout
+      amount_cents INTEGER NOT NULL,
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Cost model: cents per 1k tokens per (provider, model). model='*' = wildcard for a provider.
+    CREATE TABLE IF NOT EXISTS cost_model (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_cents_per_1k REAL NOT NULL DEFAULT 0,
+      output_cents_per_1k REAL NOT NULL DEFAULT 0,
+      flat_cents REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      UNIQUE(provider, model)
     );
   `);
 }

@@ -2,17 +2,20 @@
 // Zero-dep node:http. Endpoints follow §11; read endpoints feed the dashboard.
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
-import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken } from '../shared/ids.mjs';
-import { BROKER, DEFAULTS, PATHS } from '../shared/config.mjs';
+import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
+import { BROKER, DEFAULTS, PATHS, FUEL } from '../shared/config.mjs';
 import { planObjective } from './planner.mjs';
-import { pickJob } from './scheduler.mjs';
+import { pickJob, workerOffersBedrock } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
-import { reputationFor } from './reputation.mjs';
+import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
+import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
+import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'content-type': 'application/json' });
@@ -86,6 +89,18 @@ function claim(body) {
     d.prepare('UPDATE workers SET active_slots = active_slots + 1 WHERE id = ?').run(worker.id);
   });
 
+  // Reserve fuel for paid (Bedrock) workers at claim time.
+  // If balance is insufficient, pickJob already excluded the job — this is belt-and-suspenders.
+  if (workerOffersBedrock(worker.id)) {
+    const bedrockModel = (() => {
+      try {
+        const models = JSON.parse(d.prepare('SELECT manifest_json FROM workers WHERE id=?').get(worker.id)?.manifest_json || '{}').models || [];
+        return (models.find((m) => m.provider === 'bedrock') || {}).model || 'claude-3-haiku';
+      } catch { return 'claude-3-haiku'; }
+    })();
+    reserveFuel(PRIMARY_ACCOUNT, job.id, estimateJobCost(job, 'bedrock', bedrockModel));
+  }
+
   const objective = parseRow(d.prepare('SELECT * FROM objectives WHERE id=?').get(job.objective_id), ['contract_json']);
   const spec = job.spec_json ? JSON.parse(job.spec_json) : {};
   logEvent('job', job.id, 'claimed', { worker: worker.id });
@@ -123,8 +138,40 @@ function claim(body) {
       acceptance_criteria: spec.acceptance_criteria || [],
       worktree: join(PATHS.worktrees, job.id),
       review_target,
+      // Resume payload: if a prior worker dropped this job, hand over its latest checkpoint
+      // so the claiming worker continues instead of restarting (PLAN: resumable handoff).
+      checkpoint: latestCheckpoint(job.id),
+      attempts: job.attempts || 0,
     },
   };
+}
+
+// ---- Checkpoints: partial progress so a dropped job RESUMES, not restarts -----
+function saveCheckpoint(jobId, body) {
+  const d = getDb();
+  const job = d.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
+  if (!job) return { error: 'unknown job', code: 404 };
+  if (!body.lease_token || body.lease_token !== job.lease_token) {
+    return { error: 'invalid or expired lease', code: 409 };
+  }
+  const seq = (job.checkpoint_seq || 0) + 1;
+  transaction(() => {
+    d.prepare(
+      `INSERT INTO checkpoints(id, job_id, worker_id, seq, state_json, note, created_at) VALUES(?,?,?,?,?,?,?)`
+    ).run(checkpointId(), jobId, job.assigned_worker_id, seq, JSON.stringify(body.state || {}), body.note || null, now());
+    d.prepare('UPDATE jobs SET checkpoint_seq=?, updated_at=? WHERE id=?').run(seq, now(), jobId);
+  });
+  return { ok: true, seq };
+}
+
+function latestCheckpoint(jobId) {
+  const row = getDb().prepare('SELECT state_json FROM checkpoints WHERE job_id=? ORDER BY seq DESC LIMIT 1').get(jobId);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.state_json);
+  } catch {
+    return null;
+  }
 }
 
 async function submitResult(jobId, body) {
@@ -226,6 +273,60 @@ function defaultIssueContract(testCmd) {
   };
 }
 
+// ---- Fuel ledger endpoints ---------------------------------------------------
+
+function getFuelBalance(accountId = PRIMARY_ACCOUNT) {
+  return { account_id: accountId, balance_cents: getBalance(accountId) };
+}
+
+function postFuelCredit(body) {
+  const amountCents = Number(body.amount_cents);
+  if (!Number.isFinite(amountCents) || amountCents <= 0) {
+    return { error: 'amount_cents must be a positive number', code: 400 };
+  }
+  const accountId = body.account_id || PRIMARY_ACCOUNT;
+  creditFuel(accountId, amountCents, body.note || null);
+  return { ok: true, account_id: accountId, credited_cents: amountCents, balance_cents: getBalance(accountId) };
+}
+
+function getFuelLog(accountId = PRIMARY_ACCOUNT, limit = 50) {
+  return fuelLog(accountId, limit);
+}
+
+// ---- Payment endpoints (x402 value rail) -------------------------------------
+
+// POST /payments/verify — verify an incoming x402 payment against requirements and, if valid,
+// credit the payer's account balance (or grant access to the paid resource).
+// With MOLT_FUEL_REAL=0, facilitator calls are simulated — no real on-chain action occurs.
+async function postPaymentsVerify(body) {
+  const { payment_header, payment_requirements } = body;
+  if (!payment_header || !payment_requirements) {
+    return { error: 'payment_header and payment_requirements required', code: 400 };
+  }
+  const result = await verifyPayment(payment_header, payment_requirements);
+  if (!result.isValid) {
+    return { error: `payment invalid: ${result.invalidReason || 'rejected by facilitator'}`, code: 402 };
+  }
+  // Settle on-chain (no-op when MOLT_FUEL_REAL=0).
+  await settlePayment(payment_header, payment_requirements);
+  return { ok: true, settled: !result.simulated, simulated: result.simulated ?? false };
+}
+
+// POST /payments/request — contributor requests payout for an accepted job.
+// Records a pending payout entry in the fuel ledger; actual USDC transfer is human-operated.
+function postPaymentsRequest(body) {
+  const { job_id, wallet_address, amount_cents } = body;
+  if (!job_id || !wallet_address) {
+    return { error: 'job_id and wallet_address required', code: 400 };
+  }
+  const d = getDb();
+  const job = d.prepare('SELECT * FROM jobs WHERE id=? AND status=?').get(job_id, 'accepted');
+  if (!job) return { error: 'job not found or not accepted', code: 404 };
+  const cents = Number(amount_cents) || 0;
+  recordPayout(PRIMARY_ACCOUNT, job_id, cents, wallet_address);
+  return { ok: true, job_id, wallet_address, amount_cents: cents, note: 'pending human/treasury disbursement' };
+}
+
 // ---- Read endpoints (dashboard / CLI status) ---------------------------------
 
 function listObjectives() {
@@ -253,20 +354,25 @@ function listEvents(limit = 100) {
 
 // ---- Lease sweep: requeue jobs whose worker died (lease expired) --------------
 
-function sweepLeases() {
+export function sweepLeases() {
   const d = getDb();
   const expired = d
     .prepare(`SELECT * FROM jobs WHERE status='claimed' AND lease_until IS NOT NULL AND lease_until < ?`)
     .all(now());
   for (const job of expired) {
+    // Requeue but REMEMBER who dropped it (continuation avoids re-handing to the dropper)
+    // and KEEP the checkpoint row so the next worker resumes from partial progress.
     d.prepare(
-      `UPDATE jobs SET status='pending', lease_token=NULL, lease_until=NULL, assigned_worker_id=NULL, updated_at=? WHERE id=?`
-    ).run(now(), job.id);
+      `UPDATE jobs SET status='pending', lease_token=NULL, lease_until=NULL, assigned_worker_id=NULL, last_failed_worker_id=?, updated_at=? WHERE id=?`
+    ).run(job.assigned_worker_id || null, now(), job.id);
     d.prepare(`UPDATE assignments SET status='expired', finished_at=? WHERE job_id=? AND finished_at IS NULL`).run(now(), job.id);
     if (job.assigned_worker_id) {
       d.prepare('UPDATE workers SET active_slots = MAX(0, active_slots - 1) WHERE id=?').run(job.assigned_worker_id);
+      recordEvent(job.assigned_worker_id, job.capability_required, 'lease_expired', job.id);
     }
-    logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id });
+    // Refund any fuel reserved by the dropped worker so the balance is available for the next.
+    refundFuel(PRIMARY_ACCOUNT, job.id);
+    logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id, resumable: !!latestCheckpoint(job.id) });
   }
 }
 
@@ -292,19 +398,56 @@ async function serveStatic(req, res, urlPath) {
   }
 }
 
+// ---- Auth: team-gating via API keys ------------------------------------------
+// Keys are presented as `Authorization: Bearer <id>.<secret>`. Only the id and a sha256
+// of the secret are stored (api_keys table); the raw secret never persists.
+function authOk(req) {
+  const hdr = req.headers['authorization'] || '';
+  const m = hdr.match(/^Bearer\s+(\S+)$/i);
+  if (!m) return false;
+  const dot = m[1].indexOf('.');
+  if (dot < 0) return false;
+  const id = m[1].slice(0, dot);
+  const secret = m[1].slice(dot + 1);
+  if (!id || !secret) return false;
+  const d = getDb();
+  const row = d.prepare('SELECT * FROM api_keys WHERE id=? AND revoked=0').get(id);
+  if (!row) return false;
+  const hash = createHash('sha256').update(secret).digest('hex');
+  if (hash !== row.hash) return false;
+  d.prepare('UPDATE api_keys SET last_used=? WHERE id=?').run(now(), id);
+  return true;
+}
+
 // ---- Server ------------------------------------------------------------------
 
 export function startBroker() {
   getDb(); // bootstrap schema
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, BROKER.url);
-    const path = url.pathname;
+    const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
+    const rawPath = url.pathname;
+    // Strip the ALB path prefix so the router sees /health, /jobs, etc. regardless
+    // of whether the broker sits at / or /grid (MOLT_PATH_PREFIX=/grid).
+    const prefix = BROKER.pathPrefix;
+    const path = prefix && rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : rawPath;
     const method = req.method;
     try {
+      // Team gating: when MOLT_AUTH=1, every mutating (POST) endpoint needs a valid API key.
+      // Reads (dashboard/status) and /health stay open. (PLAN: team-only during commissioning.)
+      // Checked live (not cached) so it can be toggled without a restart.
+      if (process.env.MOLT_AUTH === '1' && method === 'POST' && !authOk(req)) {
+        return json(res, 401, { error: 'unauthorized: send Authorization: Bearer <api-key>' });
+      }
+
       // API
       if (method === 'POST' && path === '/workers/register') return json(res, 200, await registerWorker(await readBody(req)));
       if (method === 'POST' && path === '/workers/heartbeat') return json(res, 200, heartbeat(await readBody(req)));
       if (method === 'POST' && path === '/jobs/claim') return json(res, 200, claim(await readBody(req)));
+      const checkpointMatch = path.match(/^\/jobs\/([^/]+)\/checkpoint$/);
+      if (method === 'POST' && checkpointMatch) {
+        const r = saveCheckpoint(checkpointMatch[1], await readBody(req));
+        return json(res, r.code || 200, r);
+      }
       const resultMatch = path.match(/^\/jobs\/([^/]+)\/result$/);
       if (method === 'POST' && resultMatch) {
         const r = await submitResult(resultMatch[1], await readBody(req));
@@ -316,7 +459,16 @@ export function startBroker() {
         return json(res, r.code || 200, r);
       }
       const approveMatch = path.match(/^\/objectives\/([^/]+)\/approve$/);
-      if (method === 'POST' && approveMatch) return json(res, 200, await approveObjective(approveMatch[1]));
+      if (method === 'POST' && approveMatch) { const r = await approveObjective(approveMatch[1]); return json(res, r.code || 200, r); }
+
+      // Fuel ledger
+      if (method === 'GET' && path === '/fuel/balance') return json(res, 200, getFuelBalance(url.searchParams.get('account') || PRIMARY_ACCOUNT));
+      if (method === 'GET' && path === '/fuel/log') return json(res, 200, getFuelLog(url.searchParams.get('account') || PRIMARY_ACCOUNT, Number(url.searchParams.get('limit') || 50)));
+      if (method === 'POST' && path === '/fuel/credit') { const r = postFuelCredit(await readBody(req)); return json(res, r.code || 200, r); }
+
+      // Payments (x402 value rail)
+      if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(await readBody(req)); return json(res, r.code || 200, r); }
+      if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(await readBody(req)); return json(res, r.code || 200, r); }
 
       if (method === 'GET' && path === '/objectives') return json(res, 200, listObjectives());
       if (method === 'GET' && path === '/jobs') return json(res, 200, listJobs(url.searchParams.get('objective')));

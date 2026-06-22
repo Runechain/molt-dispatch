@@ -23,3 +23,25 @@ export function workerId(hint) {
 export function eventId() {
   return `ev_${randomBytes(6).toString('hex')}`;
 }
+
+export function accountId() {
+  return `acct_${randomBytes(8).toString('hex')}`;
+}
+
+// API keys are presented to the client once as `${id}.${secret}`. Only the id and a
+// sha256 of the secret are stored (see broker auth) — the raw secret never persists.
+export function apiKeyId() {
+  return `mk_${randomBytes(6).toString('hex')}`;
+}
+
+export function apiKeySecret() {
+  return randomBytes(24).toString('hex');
+}
+
+export function checkpointId() {
+  return `ck_${randomBytes(6).toString('hex')}`;
+}
+
+export function fuelLedgerId() {
+  return `fl_${randomBytes(6).toString('hex')}`;
+}
