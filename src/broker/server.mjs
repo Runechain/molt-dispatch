@@ -468,29 +468,36 @@ function maybeEnableAgents() {
     cheap: process.env.MOLT_DELIB_CHEAP || 'local',
     premium: process.env.MOLT_DELIB_PREMIUM || 'bedrock',
   };
-  // Premium (Bedrock) deliberation/decomposition calls are broker-internal, not grid jobs — meter
-  // and budget-gate them against the same fuel ledger so they can't become unbounded spend. When
-  // the budget is exhausted, premium calls throw: deliberate fails safe to 'escalate', the planner
-  // falls back to the template.
-  const budgetGate = () => {
-    if (getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) throw new Error('insufficient fuel for premium agent call');
+  const tierModels = {
+    cheap: process.env.MOLT_DELIB_CHEAP_MODEL || undefined,
+    premium: process.env.MOLT_DELIB_PREMIUM_MODEL || undefined,
   };
+  // The fuel gate/meter govern only the funded Bedrock path. Directly-billed providers (DeepSeek,
+  // local) are paid out-of-band via their own API key, not drawn from the fuel ledger, so they run
+  // without a budget gate. (Premium-on-Bedrock still fails safe to 'escalate' when the ledger is dry.)
+  const premiumIsBedrock = tierAdapters.premium === 'bedrock';
+  const budgetGate = premiumIsBedrock
+    ? () => { if (getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) throw new Error('insufficient fuel for premium agent call'); }
+    : null;
   let meterSeq = 0;
-  const meter = ({ provider, model, usage }) => {
-    const inTok = usage.input_tokens ?? usage.tokens_in ?? 0;
-    const outTok = usage.output_tokens ?? usage.tokens_out ?? 500;
-    const cents = estimateCost(provider || 'bedrock', model || 'claude-3-haiku', inTok, outTok);
-    chargeFuel(PRIMARY_ACCOUNT, `agent-${now()}-${++meterSeq}`, cents, `agent premium call ${provider || '?'}/${model || '?'}`);
-  };
+  const meter = premiumIsBedrock
+    ? ({ provider, model, usage }) => {
+        const inTok = usage.input_tokens ?? usage.tokens_in ?? 0;
+        const outTok = usage.output_tokens ?? usage.tokens_out ?? 500;
+        const cents = estimateCost(provider || 'bedrock', model || 'claude-3-haiku', inTok, outTok);
+        chargeFuel(PRIMARY_ACCOUNT, `agent-${now()}-${++meterSeq}`, cents, `agent premium call ${provider || '?'}/${model || '?'}`);
+      }
+    : null;
   let infer = null;
-  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, log: () => {}, budgetGate, meter }));
+  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, tierModels, log: () => {}, budgetGate, meter }));
+  const tag = (t) => `${tierAdapters[t]}${tierModels[t] ? ':' + tierModels[t] : ''}`;
   if (process.env.MOLT_INTEGRATION_AGENT === '1') {
     setIntegrationInfer(sharedInfer());
-    console.log(`[broker] integration agent ON (cheap=${tierAdapters.cheap}, premium=${tierAdapters.premium})`);
+    console.log(`[broker] integration agent ON (cheap=${tag('cheap')}, premium=${tag('premium')})`);
   }
   if (process.env.MOLT_PLANNER_AGENT === '1') {
     setPlannerInfer(sharedInfer());
-    console.log(`[broker] planner agent ON (premium=${tierAdapters.premium})`);
+    console.log(`[broker] planner agent ON (premium=${tag('premium')})`);
   }
 }
 

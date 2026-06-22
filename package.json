@@ -13,7 +13,7 @@
     "broker": "node bin/molt.mjs broker start",
     "worker": "node bin/molt.mjs worker start",
     "dashboard": "node bin/molt.mjs dashboard",
-    "test": "node scripts/verify_grid.mjs && node scripts/verify_live.mjs && node scripts/verify_fuel.mjs && node scripts/verify_deliberation.mjs && node scripts/verify_objective_deps.mjs && node scripts/verify_integration_agent.mjs && node scripts/verify_planner_agent.mjs"
+    "test": "node scripts/verify_grid.mjs && node scripts/verify_live.mjs && node scripts/verify_fuel.mjs && node scripts/verify_deliberation.mjs && node scripts/verify_objective_deps.mjs && node scripts/verify_integration_agent.mjs && node scripts/verify_planner_agent.mjs && node scripts/verify_deepseek_provider.mjs"
   },
   "license": "AGPL-3.0-or-later",
   "private": true

@@ -115,4 +115,15 @@ console.log('makeProviderInfer — premium budget gate + metering');
   ok(cheapMetered === false, 'cheap calls are not metered (only premium spend is charged)');
 }
 
+console.log('makeProviderInfer — per-tier model selection (DeepSeek chat vs reasoner)');
+{
+  let lastModel;
+  const echo = { run: async (job) => { lastModel = job.model; return { status: 'completed', output: 'ok', provider: 'deepseek', model: job.model, usage: {} }; } };
+  const infer = makeProviderInfer({ getAdapter: () => echo, tierAdapters: { cheap: 'deepseek', premium: 'deepseek' }, tierModels: { cheap: 'deepseek-chat', premium: 'deepseek-reasoner' } });
+  await infer({ tier: 'cheap', prompt: 'x' });
+  ok(lastModel === 'deepseek-chat', 'cheap tier → deepseek-chat passed as job.model');
+  await infer({ tier: 'premium', prompt: 'x' });
+  ok(lastModel === 'deepseek-reasoner', 'premium tier → deepseek-reasoner passed as job.model');
+}
+
 console.log(`\n✅ deliberation DAG: ${passed} checks passed`);

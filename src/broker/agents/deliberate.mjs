@@ -167,7 +167,10 @@ function transcriptOf(done) {
 // (so deliberate fails safe to 'escalate' and the planner falls back to the template). meter()
 // is called after a successful premium call so the broker can charge the fuel ledger — these
 // internal agent calls would otherwise be unmetered, unbounded premium spend.
-export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local', premium: 'bedrock' }, log = () => {}, budgetGate = null, meter = null } = {}) {
+// tierModels (optional) selects a concrete model per tier — e.g. { cheap:'deepseek-chat',
+// premium:'deepseek-reasoner' } — passed to the adapter as job.model so one provider serves both
+// the cheap debate panel and the premium judge.
+export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local', premium: 'bedrock' }, tierModels = {}, log = () => {}, budgetGate = null, meter = null } = {}) {
   if (typeof getAdapter !== 'function') throw new Error('makeProviderInfer: getAdapter is required');
   return async ({ tier, system, prompt }) => {
     const name = tierAdapters[tier] || tierAdapters.cheap;
@@ -178,6 +181,7 @@ export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local',
       type: 'inference',
       capability_required: 'inference',
       title: 'deliberation',
+      model: tierModels[tier] || undefined,
       prompt: system ? `${system}\n\n${prompt}` : prompt,
     };
     const ctx = { log, signal: undefined, checkpoint: null, saveCheckpoint: null };
