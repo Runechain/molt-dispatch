@@ -61,14 +61,31 @@ jobs:
           docker push $ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG
           echo "image=$ECR_REGISTRY/$ECR_REPOSITORY:$IMAGE_TAG" >> $GITHUB_OUTPUT
 
-      # Patch the EFS IDs into the task definition from Terraform outputs
-      # stored as GitHub secrets after `terraform apply`.
+      # Look up the EFS IDs created by infra/terraform/apply.sh at deploy time —
+      # no manual GitHub secrets needed; CI has AWS access via OIDC.
+      - name: Resolve EFS IDs from AWS
+        id: efs
+        run: |
+          EFS_ID=$(aws efs describe-file-systems \
+            --query "FileSystems[?Tags[?Key=='Name'&&Value=='molt-broker-data']].FileSystemId | [0]" \
+            --output text)
+          if [ -z "$EFS_ID" ] || [ "$EFS_ID" = "None" ]; then
+            echo "EFS file system tagged Name=molt-broker-data not found — run infra/terraform/apply.sh first."
+            exit 1
+          fi
+          EFS_AP_ID=$(aws efs describe-access-points \
+            --file-system-id "$EFS_ID" \
+            --query "AccessPoints[0].AccessPointId" \
+            --output text)
+          echo "efs_id=$EFS_ID"    >> $GITHUB_OUTPUT
+          echo "efs_ap_id=$EFS_AP_ID" >> $GITHUB_OUTPUT
+
       - name: Patch task definition (EFS IDs + image)
         id: task-def-rendered
         env:
-          IMAGE:      ${{ steps.build.outputs.image }}
-          EFS_ID:     ${{ secrets.MOLT_EFS_ID }}
-          EFS_AP_ID:  ${{ secrets.MOLT_EFS_AP_ID }}
+          IMAGE:     ${{ steps.build.outputs.image }}
+          EFS_ID:    ${{ steps.efs.outputs.efs_id }}
+          EFS_AP_ID: ${{ steps.efs.outputs.efs_ap_id }}
         run: |
           PATCHED=$(jq \
             --arg img "$IMAGE" \

@@ -8,13 +8,28 @@
 # in SSM Parameter Store (/molt/MOLT_API_KEY in us-east-1).
 
 variable "account_id"         { type = string; default = "901889466248" }
-variable "vpc_id"             { type = string; default = "vpc-xxxxxxxx" } # us-east-1 default VPC
-variable "subnet_ids"         { type = list(string); default = [] }       # populate for your us-east-1 VPC
 variable "ecs_cluster_name"   { type = string; default = "molt-worker-cluster" }
 variable "ecr_repo"           { type = string; default = "molt-broker" } # reuse broker image
 variable "broker_url"         { type = string; default = "https://play.runechaingame.com/grid" }
 variable "bedrock_model"      { type = string; default = "anthropic.claude-3-haiku-20240307-v1:0" }
 variable "tags"               { type = map(string); default = { project = "molt-dispatch" } }
+
+# --- Default VPC + subnets (auto-discovered; no manual vpc_id/subnet_ids needed) ---
+
+data "aws_vpc" "default" {
+  default = true
+}
+
+data "aws_subnets" "default" {
+  filter {
+    name   = "vpc-id"
+    values = [data.aws_vpc.default.id]
+  }
+  filter {
+    name   = "defaultForAz"
+    values = ["true"]
+  }
+}
 
 # --- ECR (us-east-1) — the broker image reused as the worker image -----------
 # The image is built once in ca-west-1 ECR. For cross-region pulls, either
@@ -50,7 +65,7 @@ resource "aws_ecs_cluster" "worker" {
 resource "aws_security_group" "worker" {
   name        = "molt-bedrock-worker-sg"
   description = "molt Bedrock worker — outbound HTTPS to broker + Bedrock"
-  vpc_id      = var.vpc_id
+  vpc_id      = data.aws_vpc.default.id
   tags        = var.tags
 }
 
@@ -154,7 +169,7 @@ resource "aws_ecs_service" "worker" {
   tags            = var.tags
 
   network_configuration {
-    subnets          = var.subnet_ids
+    subnets          = data.aws_subnets.default.ids
     security_groups  = [aws_security_group.worker.id]
     assign_public_ip = true
   }
