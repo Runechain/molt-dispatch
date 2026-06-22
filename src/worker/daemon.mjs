@@ -2,18 +2,26 @@
 // locally-authenticated adapter. The broker never sees credentials — the adapter owns
 // the logged-in session on this machine (WHITEPAPER §5/§9).
 
-import { mkdirSync } from 'node:fs';
+import { mkdirSync, writeFileSync } from 'node:fs';
+import { join } from 'node:path';
 import { hostname } from 'node:os';
-import { BROKER, DEFAULTS, PATHS } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, AUTH } from '../shared/config.mjs';
 import { workerId as mkWorkerId } from '../shared/ids.mjs';
-import { getAdapter, resolveAdapter, listAdapters } from './adapters/index.mjs';
+import { getAdapter, resolveAdapter, listAdapters, adapterMeta } from './adapters/index.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+let inflight = null; // AbortController for the job currently running (so SIGINT can stop it)
+
+function authHeaders() {
+  const h = { 'content-type': 'application/json' };
+  if (AUTH.apiKey) h.authorization = `Bearer ${AUTH.apiKey}`;
+  return h;
+}
 
 async function api(path, body) {
   const res = await fetch(`${BROKER.url}${path}`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify(body),
   });
   return res.json();
@@ -41,7 +49,15 @@ export async function startWorker(opts = {}) {
   const trustTier = opts.trustTier ?? Number(process.env.MOLT_TRUST ?? 4);
   const maxSlots = opts.maxSlots ?? 1;
 
-  const manifest = { capabilities, interfaces: Object.fromEntries(enabled.map((n) => [n, { available: true }])) };
+  // Heterogeneous manifest: advertise the concrete provider/model behind each enabled adapter
+  // so the broker can match inference jobs to nodes and score reputation per model.
+  const models = enabled.map(adapterMeta).filter((m) => m && m.kind === 'provider' && m.model);
+  const manifest = {
+    capabilities,
+    interfaces: Object.fromEntries(enabled.map((n) => [n, { available: true }])),
+    models,
+  };
+  if (models.length) console.log(`[worker] models: ${models.map((m) => `${m.provider}:${m.model}`).join(', ')}`);
   const reg = await api('/workers/register', {
     worker_id: id,
     owner_id: opts.owner || hostname(),
@@ -57,6 +73,13 @@ export async function startWorker(opts = {}) {
   let stopped = false;
   process.on('SIGINT', () => {
     stopped = true;
+    if (inflight) {
+      try {
+        inflight.abort();
+      } catch {
+        /* ignore */
+      }
+    }
     console.log('\n[worker] shutting down');
     process.exit(0);
   });
@@ -122,17 +145,31 @@ async function executeJob(job, enabledNames, myId) {
       workspace = await ws.prepareWorktree(job);
     }
 
+    inflight = new AbortController();
+    const artifactsDir = artifactsDirFor(job);
     const ctx = {
       worktree: workspace?.dir || null,
-      artifactsDir: artifactsDirFor(job),
+      artifactsDir,
       log: (m) => console.log(`   ${m}`),
+      // Resumable handoff: providers stream partial progress here; if this worker dies the
+      // broker keeps the latest checkpoint and the next worker continues from it.
+      checkpoint: job.checkpoint || null,
+      signal: inflight.signal,
+      saveCheckpoint: (state) => api(`/jobs/${job.job_id}/checkpoint`, { lease_token: job.lease_token, state }),
     };
+    if (job.checkpoint) console.log(`[worker] resuming ${job.job_id} from checkpoint`);
 
     const draft = await picked.adapter.run(job, ctx);
     draft.review_worker_id = myId;
 
     // collect artifacts the workspace captured (patch/status/tests), if any
-    const artifacts = workspace ? await workspace.capture(draft) : draft.artifacts || [];
+    let artifacts = workspace ? await workspace.capture(draft) : draft.artifacts || [];
+    // Persist inference completions to a file artifact (inline text isn't stored by the broker).
+    if (draft.output != null) {
+      const p = join(artifactsDir, 'completion.txt');
+      writeFileSync(p, String(draft.output));
+      artifacts = [{ kind: 'completion', path: p }, ...artifacts.filter((a) => a.kind !== 'completion')];
+    }
 
     await submit(job, { lease_token: job.lease_token, ...draft, artifacts });
     console.log(`[worker] submitted ${job.job_id} (${draft.status})`);
@@ -143,6 +180,7 @@ async function executeJob(job, enabledNames, myId) {
     // Implementation worktrees are kept so the broker can run static/automated validation
     // against them and merge on approval; the broker removes them later. Other jobs
     // (e.g. review) own their worktree and clean it up here.
+    inflight = null;
     const brokerOwnsWorktree = job.type === 'code.implementation';
     if (workspace?.cleanup && !brokerOwnsWorktree) await workspace.cleanup().catch(() => {});
   }
@@ -157,7 +195,7 @@ function artifactsDirFor(job) {
 async function submit(job, body) {
   const res = await fetch(`${BROKER.url}/jobs/${job.job_id}/result`, {
     method: 'POST',
-    headers: { 'content-type': 'application/json' },
+    headers: authHeaders(),
     body: JSON.stringify(body),
   });
   const out = await res.json().catch(() => ({}));

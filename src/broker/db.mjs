@@ -21,9 +21,18 @@ export function getDb() {
 
 // Add columns to pre-existing databases (node:sqlite has no IF NOT EXISTS for columns).
 function migrate(d) {
-  const cols = d.prepare('PRAGMA table_info(objectives)').all().map((c) => c.name);
-  if (!cols.includes('source_issue')) d.exec('ALTER TABLE objectives ADD COLUMN source_issue INTEGER');
-  if (!cols.includes('pr_url')) d.exec('ALTER TABLE objectives ADD COLUMN pr_url TEXT');
+  const addCol = (table, col, ddl) => {
+    const cols = d.prepare(`PRAGMA table_info(${table})`).all().map((c) => c.name);
+    if (!cols.includes(col)) d.exec(`ALTER TABLE ${table} ADD COLUMN ${ddl}`);
+  };
+  addCol('objectives', 'source_issue', 'source_issue INTEGER');
+  addCol('objectives', 'pr_url', 'pr_url TEXT');
+  // Heterogeneous reputation: per (worker, capability, model/provider).
+  addCol('reputation_events', 'model', 'model TEXT');
+  addCol('reputation_events', 'provider', 'provider TEXT');
+  // Fault tolerance: remember who dropped a job so continuation avoids re-handing it.
+  addCol('jobs', 'last_failed_worker_id', 'last_failed_worker_id TEXT');
+  addCol('jobs', 'checkpoint_seq', 'checkpoint_seq INTEGER DEFAULT 0');
 }
 
 function bootstrap(d) {
@@ -136,6 +145,38 @@ function bootstrap(d) {
       entity_id TEXT NOT NULL,
       event_type TEXT NOT NULL,
       payload_json TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Partial progress so a dropped job can be RESUMED, not restarted (fault tolerance).
+    CREATE TABLE IF NOT EXISTS checkpoints (
+      id TEXT PRIMARY KEY,
+      job_id TEXT NOT NULL REFERENCES jobs(id),
+      worker_id TEXT,
+      seq INTEGER NOT NULL DEFAULT 0,   -- monotonic per job; latest wins on requeue
+      state_json TEXT NOT NULL,         -- adapter-defined partial-progress payload
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Team-gating + (Phase 2) fuel budget. Balance is in USDC cents; simulated until MOLT_FUEL_REAL=1.
+    CREATE TABLE IF NOT EXISTS accounts (
+      id TEXT PRIMARY KEY,
+      name TEXT,
+      role TEXT NOT NULL DEFAULT 'team',   -- team|worker|consumer
+      balance_cents INTEGER NOT NULL DEFAULT 0,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS api_keys (
+      id TEXT PRIMARY KEY,                 -- public part (mk_...), sent with the secret as id.secret
+      account_id TEXT REFERENCES accounts(id),
+      hash TEXT NOT NULL,                  -- sha256(secret); the raw secret is never stored
+      name TEXT,
+      scopes TEXT NOT NULL DEFAULT 'dispatch,worker',  -- csv: dispatch|worker|approve|admin
+      last_used INTEGER,
+      revoked INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
     );
   `);

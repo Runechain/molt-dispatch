@@ -7,13 +7,17 @@ import { dirname, join, resolve } from 'node:path';
 const here = dirname(fileURLToPath(import.meta.url));
 export const ROOT = resolve(here, '..', '..'); // molt-dispatch/
 
+// State root. Defaults to the project dir (single local install). MOLT_DATA_DIR relocates
+// db/artifacts/worktrees — used by tests (temp dir) and by the deployed broker (EFS mount).
+const DATA_ROOT = process.env.MOLT_DATA_DIR ? resolve(process.env.MOLT_DATA_DIR) : ROOT;
+
 export const PATHS = {
   root: ROOT,
-  data: join(ROOT, 'data'),
-  db: join(ROOT, 'data', 'molt.db'),
-  artifacts: join(ROOT, 'artifacts'),
-  worktrees: join(ROOT, 'worktrees'),
-  dashboard: join(ROOT, 'dashboard'),
+  data: join(DATA_ROOT, 'data'),
+  db: join(DATA_ROOT, 'data', 'molt.db'),
+  artifacts: join(DATA_ROOT, 'artifacts'),
+  worktrees: join(DATA_ROOT, 'worktrees'),
+  dashboard: join(ROOT, 'dashboard'), // static assets always ship with the code
 };
 
 export const BROKER = {
@@ -30,4 +34,17 @@ export const DEFAULTS = {
   heartbeatSeconds: 10, // worker heartbeat cadence
   claimPollSeconds: 3, // worker poll cadence when idle
   leaseSweepSeconds: 15, // broker requeues expired leases this often
+};
+
+// Team-gating. Off by default so the local quick-start needs no key; deployed/team
+// installs set MOLT_AUTH=1. Clients (CLI/worker) send MOLT_API_KEY when present.
+export const AUTH = {
+  enabled: process.env.MOLT_AUTH === '1',
+  apiKey: process.env.MOLT_API_KEY || null,
+  header: 'authorization',
+};
+
+// Fuel / budget (Phase 2). Real spend stays behind a flag + a hard cap.
+export const FUEL = {
+  real: process.env.MOLT_FUEL_REAL === '1', // false = simulated cents, no real spend
 };

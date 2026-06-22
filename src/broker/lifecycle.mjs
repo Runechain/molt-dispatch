@@ -38,23 +38,29 @@ export async function onResult(jobId, result, ctx = {}) {
   logEvent('job', job.id, 'validated', { pass: verdict.pass, layers: verdict.layers, reasons: verdict.reasons });
 
   if (verdict.pass) {
-    acceptJob(job);
+    acceptJob(job, result);
   } else {
-    rejectOrRetry(job, verdict.reasons);
+    rejectOrRetry(job, verdict.reasons, result);
   }
   return verdict;
 }
 
-function acceptJob(job) {
+function acceptJob(job, result = {}) {
+  const meta = { model: result.model, provider: result.provider };
   setJobStatus(job.id, 'accepted');
-  recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id);
-  logEvent('job', job.id, 'accepted', { worker: job.assigned_worker_id });
+  recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id, meta);
+  // If this job had been dropped before (a checkpoint or prior attempt), the worker that
+  // carried it across the line earns a resilience credit (PLAN: reward successful resumes).
+  if ((job.checkpoint_seq || 0) > 0 || (job.attempts || 0) > 0) {
+    recordEvent(job.assigned_worker_id, job.capability_required, 'resumed_successfully', job.id, meta);
+  }
+  logEvent('job', job.id, 'accepted', { worker: job.assigned_worker_id, model: result.model, provider: result.provider });
   releaseAssignment(job.id, 'accepted');
   unlockDependents(job.id);
   finalizeObjective(job.objective_id);
 }
 
-function rejectOrRetry(job, reasons) {
+function rejectOrRetry(job, reasons, result = {}) {
   const attempts = (job.attempts || 0) + 1;
   if (attempts < MAX_ATTEMPTS) {
     // retry: put it back in the pool, clear the lease (§12 retry-once).
@@ -68,7 +74,7 @@ function rejectOrRetry(job, reasons) {
     logEvent('job', job.id, 'retry', { attempts, reasons });
   } else {
     setJobStatus(job.id, 'rejected', { attempts });
-    recordEvent(job.assigned_worker_id, job.capability_required, 'rejected', job.id);
+    recordEvent(job.assigned_worker_id, job.capability_required, 'rejected', job.id, { model: result.model, provider: result.provider });
     releaseAssignment(job.id, 'rejected');
     logEvent('job', job.id, 'rejected', { attempts, reasons });
     failObjective(job.objective_id, `job ${job.id} rejected: ${reasons.join('; ')}`);

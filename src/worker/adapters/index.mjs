@@ -5,21 +5,38 @@
 //   adapter.detect()     : Promise<boolean>      // is this runtime available locally?
 //   adapter.run(job, ctx): Promise<ResultDraft>  // execute, return a result draft
 //
-// ctx = { worktree, log }. ResultDraft = { status, summary, changed_files, tests_run,
-// known_risks, confidence, review?, artifacts? }. The daemon stamps lease_token on submit.
+// ctx = { worktree, log, signal, checkpoint, saveCheckpoint }. ResultDraft =
+// { status, summary, confidence, ... } plus, for inference providers: { output, provider,
+// model, usage?, partial? } and artifacts:[{kind:'completion', inline}]. The daemon stamps
+// lease_token on submit.
+//
+// Heterogeneous providers (kind:'provider') implement the same contract but also carry
+// { provider, model } so the worker manifest advertises concrete models and reputation is
+// scored per (capability, model/provider). See ./../providers/.
 
 import { mockAdapter } from './mock.mjs';
 import { codexAdapter } from './codex.mjs';
 import { claudeAdapter } from './claude.mjs';
+import { openaiCompatibleAdapter } from '../providers/openai-compatible.mjs';
+import { bedrockAdapter } from '../providers/bedrock.mjs';
 
 const ALL = {
   mock: mockAdapter,
   codex: codexAdapter,
   claude: claudeAdapter,
+  local: openaiCompatibleAdapter, // OpenAI-compatible endpoint (Ollama/vLLM/llama.cpp) — local Qwen, etc.
+  bedrock: bedrockAdapter, // AWS Bedrock — the funded continuation backstop
 };
 
 export function getAdapter(name) {
   return ALL[name];
+}
+
+// Manifest metadata for a heterogeneous worker: which concrete model/provider it serves.
+export function adapterMeta(name) {
+  const a = ALL[name];
+  if (!a) return null;
+  return { name, kind: a.kind || 'cli', provider: a.provider || name, model: a.model || null, capabilities: a.capabilities };
 }
 
 // Resolve which adapter should run a job: honor the job's adapter_hint if that adapter

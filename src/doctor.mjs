@@ -53,6 +53,36 @@ export async function doctor() {
   // mock always works
   line(OK, 'mock', 'always available (zero-cost loop / offline testing)');
 
+  console.log('\n  Inference providers (heterogeneous workers)\n');
+
+  // local OpenAI-compatible endpoint (Ollama / vLLM / llama.cpp) — the "hook up Qwen locally" path
+  const base = (process.env.MOLT_OPENAI_BASE || 'http://localhost:11434/v1').replace(/\/$/, '');
+  let localOk = false;
+  let localDetail = `${base} unreachable — start Ollama/vLLM or set MOLT_OPENAI_BASE`;
+  try {
+    const r = await fetch(`${base}/models`, { signal: AbortSignal.timeout(2000) });
+    if (r.ok) {
+      localOk = true;
+      const j = await r.json().catch(() => null);
+      const models = (j?.data || []).map((m) => m.id).slice(0, 3).join(', ');
+      localDetail = `${base} reachable${models ? ` (e.g. ${models})` : ''} · using ${process.env.MOLT_OPENAI_MODEL || 'qwen2.5:32b'}`;
+    }
+  } catch {
+    /* unreachable */
+  }
+  line(localOk ? OK : WARN, 'local (OpenAI-compat)', localDetail);
+
+  // AWS Bedrock — the funded continuation backstop (not available in ca-west-1)
+  const region = process.env.MOLT_BEDROCK_REGION || 'us-east-1';
+  const hasCreds = !!(process.env.AWS_ACCESS_KEY_ID && process.env.AWS_SECRET_ACCESS_KEY);
+  line(
+    hasCreds ? OK : WARN,
+    'bedrock (AWS)',
+    hasCreds
+      ? `creds present · region ${region} · ${process.env.MOLT_BEDROCK_MODEL || 'anthropic.claude-3-haiku-20240307-v1:0'}`
+      : `no AWS creds — set AWS_ACCESS_KEY_ID/SECRET (region ${region}; Bedrock not in ca-west-1)`
+  );
+
   console.log('\n  Integrations\n');
 
   // gh

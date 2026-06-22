@@ -38,6 +38,21 @@ export async function planObjective(objective) {
 // ---- Template planner --------------------------------------------------------
 
 const TEMPLATES = {
+  // A single prompt -> completion unit. No repo, no worktree, no merge — the general
+  // compute path the self-evolving engine runs on. resolveAdapter picks a provider
+  // (local Qwen / Bedrock) by capability unless the contract pins adapter_hint.
+  inference: (obj, contract) => [
+    {
+      key: 'infer',
+      type: 'inference',
+      title: obj.title,
+      capability: 'inference',
+      adapter_hint: contract.adapter_hint || null,
+      prompt: obj.prompt || obj.title,
+      spec: {},
+      depends_on: [],
+    },
+  ],
   'code.feature': (obj, contract) => [
     {
       key: 'impl',

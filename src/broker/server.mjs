@@ -2,15 +2,16 @@
 // Zero-dep node:http. Endpoints follow §11; read endpoints feed the dashboard.
 
 import http from 'node:http';
+import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
-import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken } from '../shared/ids.mjs';
+import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
 import { BROKER, DEFAULTS, PATHS } from '../shared/config.mjs';
 import { planObjective } from './planner.mjs';
 import { pickJob } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
-import { reputationFor } from './reputation.mjs';
+import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
 
@@ -123,8 +124,40 @@ function claim(body) {
       acceptance_criteria: spec.acceptance_criteria || [],
       worktree: join(PATHS.worktrees, job.id),
       review_target,
+      // Resume payload: if a prior worker dropped this job, hand over its latest checkpoint
+      // so the claiming worker continues instead of restarting (PLAN: resumable handoff).
+      checkpoint: latestCheckpoint(job.id),
+      attempts: job.attempts || 0,
     },
   };
+}
+
+// ---- Checkpoints: partial progress so a dropped job RESUMES, not restarts -----
+function saveCheckpoint(jobId, body) {
+  const d = getDb();
+  const job = d.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
+  if (!job) return { error: 'unknown job', code: 404 };
+  if (!body.lease_token || body.lease_token !== job.lease_token) {
+    return { error: 'invalid or expired lease', code: 409 };
+  }
+  const seq = (job.checkpoint_seq || 0) + 1;
+  transaction(() => {
+    d.prepare(
+      `INSERT INTO checkpoints(id, job_id, worker_id, seq, state_json, note, created_at) VALUES(?,?,?,?,?,?,?)`
+    ).run(checkpointId(), jobId, job.assigned_worker_id, seq, JSON.stringify(body.state || {}), body.note || null, now());
+    d.prepare('UPDATE jobs SET checkpoint_seq=?, updated_at=? WHERE id=?').run(seq, now(), jobId);
+  });
+  return { ok: true, seq };
+}
+
+function latestCheckpoint(jobId) {
+  const row = getDb().prepare('SELECT state_json FROM checkpoints WHERE job_id=? ORDER BY seq DESC LIMIT 1').get(jobId);
+  if (!row) return null;
+  try {
+    return JSON.parse(row.state_json);
+  } catch {
+    return null;
+  }
 }
 
 async function submitResult(jobId, body) {
@@ -253,20 +286,23 @@ function listEvents(limit = 100) {
 
 // ---- Lease sweep: requeue jobs whose worker died (lease expired) --------------
 
-function sweepLeases() {
+export function sweepLeases() {
   const d = getDb();
   const expired = d
     .prepare(`SELECT * FROM jobs WHERE status='claimed' AND lease_until IS NOT NULL AND lease_until < ?`)
     .all(now());
   for (const job of expired) {
+    // Requeue but REMEMBER who dropped it (continuation avoids re-handing to the dropper)
+    // and KEEP the checkpoint row so the next worker resumes from partial progress.
     d.prepare(
-      `UPDATE jobs SET status='pending', lease_token=NULL, lease_until=NULL, assigned_worker_id=NULL, updated_at=? WHERE id=?`
-    ).run(now(), job.id);
+      `UPDATE jobs SET status='pending', lease_token=NULL, lease_until=NULL, assigned_worker_id=NULL, last_failed_worker_id=?, updated_at=? WHERE id=?`
+    ).run(job.assigned_worker_id || null, now(), job.id);
     d.prepare(`UPDATE assignments SET status='expired', finished_at=? WHERE job_id=? AND finished_at IS NULL`).run(now(), job.id);
     if (job.assigned_worker_id) {
       d.prepare('UPDATE workers SET active_slots = MAX(0, active_slots - 1) WHERE id=?').run(job.assigned_worker_id);
+      recordEvent(job.assigned_worker_id, job.capability_required, 'lease_expired', job.id);
     }
-    logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id });
+    logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id, resumable: !!latestCheckpoint(job.id) });
   }
 }
 
@@ -292,6 +328,27 @@ async function serveStatic(req, res, urlPath) {
   }
 }
 
+// ---- Auth: team-gating via API keys ------------------------------------------
+// Keys are presented as `Authorization: Bearer <id>.<secret>`. Only the id and a sha256
+// of the secret are stored (api_keys table); the raw secret never persists.
+function authOk(req) {
+  const hdr = req.headers['authorization'] || '';
+  const m = hdr.match(/^Bearer\s+(\S+)$/i);
+  if (!m) return false;
+  const dot = m[1].indexOf('.');
+  if (dot < 0) return false;
+  const id = m[1].slice(0, dot);
+  const secret = m[1].slice(dot + 1);
+  if (!id || !secret) return false;
+  const d = getDb();
+  const row = d.prepare('SELECT * FROM api_keys WHERE id=? AND revoked=0').get(id);
+  if (!row) return false;
+  const hash = createHash('sha256').update(secret).digest('hex');
+  if (hash !== row.hash) return false;
+  d.prepare('UPDATE api_keys SET last_used=? WHERE id=?').run(now(), id);
+  return true;
+}
+
 // ---- Server ------------------------------------------------------------------
 
 export function startBroker() {
@@ -301,10 +358,22 @@ export function startBroker() {
     const path = url.pathname;
     const method = req.method;
     try {
+      // Team gating: when MOLT_AUTH=1, every mutating (POST) endpoint needs a valid API key.
+      // Reads (dashboard/status) and /health stay open. (PLAN: team-only during commissioning.)
+      // Checked live (not cached) so it can be toggled without a restart.
+      if (process.env.MOLT_AUTH === '1' && method === 'POST' && !authOk(req)) {
+        return json(res, 401, { error: 'unauthorized: send Authorization: Bearer <api-key>' });
+      }
+
       // API
       if (method === 'POST' && path === '/workers/register') return json(res, 200, await registerWorker(await readBody(req)));
       if (method === 'POST' && path === '/workers/heartbeat') return json(res, 200, heartbeat(await readBody(req)));
       if (method === 'POST' && path === '/jobs/claim') return json(res, 200, claim(await readBody(req)));
+      const checkpointMatch = path.match(/^\/jobs\/([^/]+)\/checkpoint$/);
+      if (method === 'POST' && checkpointMatch) {
+        const r = saveCheckpoint(checkpointMatch[1], await readBody(req));
+        return json(res, r.code || 200, r);
+      }
       const resultMatch = path.match(/^\/jobs\/([^/]+)\/result$/);
       if (method === 'POST' && resultMatch) {
         const r = await submitResult(resultMatch[1], await readBody(req));

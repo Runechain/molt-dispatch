@@ -3,7 +3,10 @@
 // Used to prove the plumbing (M1) and as a fast offline test harness.
 
 export const mockAdapter = {
-  capabilities: ['code.implementation', 'code.review', 'tests.unit', 'docs.technical'],
+  kind: 'provider',
+  provider: 'mock',
+  model: 'mock-1',
+  capabilities: ['code.implementation', 'code.review', 'tests.unit', 'docs.technical', 'inference'],
 
   async detect() {
     return true;
@@ -11,6 +14,23 @@ export const mockAdapter = {
 
   async run(job, ctx) {
     ctx.log(`[mock] running ${job.type} for ${job.job_id}`);
+
+    if (job.type === 'inference') {
+      // Zero-cost inference: resume from any prior partial, emit one checkpoint, complete.
+      const prior = ctx.checkpoint?.partial || '';
+      if (prior) ctx.log(`[mock] resuming inference from ${prior.length} chars`);
+      const output = (prior ? prior + ' ' : '') + `[mock completion for: ${(job.prompt || job.title || '').slice(0, 60)}]`;
+      if (ctx.saveCheckpoint) await ctx.saveCheckpoint({ partial: output }).catch(() => {});
+      return {
+        status: 'completed',
+        summary: `[mock] inference ${output.length} chars`,
+        output,
+        confidence: 0.8,
+        provider: 'mock',
+        model: 'mock-1',
+        artifacts: [{ kind: 'completion', inline: output }],
+      };
+    }
 
     if (job.type === 'code.review') {
       return {

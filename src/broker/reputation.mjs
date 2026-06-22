@@ -10,17 +10,25 @@ const WEIGHTS = {
   scope_violation: -2,
   security_violation: -3,
   on_time: +0.25,
+  // Resilience signals (PLAN: a swarm of breaking pieces; serial droppers fall out of rotation).
+  dropped: -1,
+  lease_expired: -0.75,
+  resumed_successfully: +0.5,
 };
 
-export function recordEvent(workerId, capability, eventType, evidenceJobId = null) {
+// Negative reliability events that count against trust (alongside rejected/rollback/etc).
+const BAD_EVENTS = new Set(['rejected', 'rollback', 'scope_violation', 'security_violation', 'dropped', 'lease_expired']);
+
+// meta carries { model, provider } so reputation is scored per (worker, capability, model/provider).
+export function recordEvent(workerId, capability, eventType, evidenceJobId = null, meta = {}) {
   if (!workerId || !capability) return;
   const delta = WEIGHTS[eventType] ?? 0;
   getDb()
     .prepare(
-      `INSERT INTO reputation_events(worker_id, capability, event_type, delta, evidence_job_id, created_at)
-       VALUES(?,?,?,?,?,?)`
+      `INSERT INTO reputation_events(worker_id, capability, event_type, delta, evidence_job_id, model, provider, created_at)
+       VALUES(?,?,?,?,?,?,?,?)`
     )
-    .run(workerId, capability, eventType, delta, evidenceJobId, now());
+    .run(workerId, capability, eventType, delta, evidenceJobId, meta.model || null, meta.provider || null, now());
 }
 
 // Trust in [0,1] for a (worker, capability). New workers sit at a neutral 0.5 prior
@@ -37,7 +45,8 @@ export function trustScore(workerId, capability) {
 
   const counts = Object.fromEntries(rows.map((r) => [r.event_type, r.n]));
   const accepted = counts.accepted || 0;
-  const bad = (counts.rejected || 0) + (counts.rollback || 0) + (counts.scope_violation || 0) + (counts.security_violation || 0);
+  let bad = 0;
+  for (const ev of BAD_EVENTS) bad += counts[ev] || 0;
   const total = accepted + bad;
   if (total === 0) return 0.5;
   // Laplace-smoothed accepted ratio.
