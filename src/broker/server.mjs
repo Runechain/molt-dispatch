@@ -14,6 +14,7 @@ import { onResult } from './lifecycle.mjs';
 import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
+import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor } from './objective-deps.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
 import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
 
@@ -201,8 +202,14 @@ async function submitResult(jobId, body) {
   return { ok: true, verdict };
 }
 
-function createObjective(body) {
-  return createObjectiveRow(body);
+async function createObjective(body) {
+  const out = await createObjectiveRow(body);
+  // Record + resolve declared inter-objective deps (explicit body.depends_on issue numbers, or
+  // "Depends on #N" in the prompt). resolveAndGate binds #N -> objective via source_issue.
+  const depIssues = [...new Set([...(body.depends_on || []), ...parseDependencyIssues(body.prompt)])];
+  if (depIssues.length) recordObjectiveDeps(out.objective_id, body.source_issue ?? null, depIssues);
+  const dependencies = resolveAndGate();
+  return { ...out, dependencies };
 }
 
 async function createObjectiveRow(body) {
@@ -243,8 +250,12 @@ async function importIssues(body) {
   const created = [];
   const skipped = [];
   for (const issue of res.issues) {
+    // Parse "Depends on #N" for EVERY issue — including already-imported ones — so dependencies
+    // declared on a pre-existing issue are backfilled, not just recorded on first import.
+    const depIssues = parseDependencyIssues(issue.body);
     const exists = d.prepare('SELECT id FROM objectives WHERE source_issue=?').get(issue.number);
     if (exists) {
+      if (depIssues.length) recordObjectiveDeps(exists.id, issue.number, depIssues);
       skipped.push({ issue: issue.number, objective: exists.id });
       continue;
     }
@@ -257,9 +268,13 @@ async function importIssues(body) {
       created_by: 'github-issue',
       source_issue: issue.number,
     });
+    if (depIssues.length) recordObjectiveDeps(out.objective_id, issue.number, depIssues);
     created.push({ issue: issue.number, ...out });
   }
-  return { slug: res.slug, created, skipped };
+  // One resolution pass after the whole batch — binds forward/same-batch refs, breaks cycles,
+  // and gates dependents. Conservative: unresolved upstreams keep a dependent blocked.
+  const dependencies = resolveAndGate();
+  return { slug: res.slug, created, skipped, dependencies };
 }
 
 function defaultIssueContract(testCmd) {
@@ -330,7 +345,12 @@ function postPaymentsRequest(body) {
 // ---- Read endpoints (dashboard / CLI status) ---------------------------------
 
 function listObjectives() {
-  return getDb().prepare('SELECT * FROM objectives ORDER BY created_at DESC').all();
+  // Annotate with blocked_on — the operator's escape hatch when an objective is wedged behind
+  // an upstream (never-approved, unresolved, or failed dependency). Empty array = not blocked.
+  return getDb()
+    .prepare('SELECT * FROM objectives ORDER BY created_at DESC')
+    .all()
+    .map((o) => ({ ...o, blocked_on: unsatisfiedDepsFor(o.id) }));
 }
 function listJobs(objectiveId) {
   const d = getDb();

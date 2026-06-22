@@ -116,6 +116,19 @@ function bootstrap(d) {
       PRIMARY KEY (job_id, depends_on_job_id)
     );
 
+    -- Inter-objective dependencies (cross-issue "Depends on #N"). depends_on_objective_id is
+    -- NULL until the upstream issue is imported and resolveAndGate() binds it; depends_on_issue
+    -- keeps the raw GitHub issue number so forward/out-of-batch refs resolve later. status:
+    -- 'active' = enforced, 'cycle' = a back-edge dropped by cycle detection (never enforced).
+    CREATE TABLE IF NOT EXISTS objective_dependencies (
+      objective_id TEXT NOT NULL REFERENCES objectives(id),
+      depends_on_objective_id TEXT REFERENCES objectives(id),
+      depends_on_issue INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (objective_id, depends_on_issue)
+    );
+
     CREATE TABLE IF NOT EXISTS workers (
       id TEXT PRIMARY KEY,
       owner_id TEXT,
