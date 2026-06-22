@@ -121,15 +121,18 @@ try {
   const approved = await post(`/objectives/${objs[0].id}/approve`);
   ok(approved.body.status === 'approved', 'repo-less inference objective approves without merge');
 
-  // 9. Team-gating: with MOLT_AUTH=1, POST without a key is rejected; with a key it passes.
+  // 9. Permissionless contribution: worker endpoints are ALWAYS open (anything can connect, no
+  //    key); MOLT_AUTH=1 gates ONLY operator/spend endpoints.
   process.env.MOLT_AUTH = '1';
-  const noKey = await post('/workers/register', { worker_id: 'worker-C', manifest: { capabilities: ['inference'] } });
-  ok(noKey.status === 401, 'auth on: POST without an API key is rejected (401)');
+  const workerOpen = await post('/workers/register', { worker_id: 'worker-C', manifest: { capabilities: ['inference'] } });
+  ok(workerOpen.status === 200, 'auth on: worker register is OPEN with no key (permissionless contribution)');
+  const opNoKey = await post('/objectives', { title: 'auth-test' });
+  ok(opNoKey.status === 401, 'auth on: operator endpoint (POST /objectives) rejected without a key (401)');
   const k = createKey({ name: 'test' });
-  const withKey = await post('/workers/register', { worker_id: 'worker-C', manifest: { capabilities: ['inference'] } }, k.key);
-  ok(withKey.status === 200, 'auth on: POST with a valid API key is accepted');
-  const badKey = await post('/workers/register', { worker_id: 'worker-D', manifest: {} }, 'mk_bogus.deadbeef');
-  ok(badKey.status === 401, 'auth on: a bogus API key is rejected');
+  const opWithKey = await post('/objectives', { title: 'auth-test' }, k.key);
+  ok(opWithKey.status === 200, 'auth on: operator endpoint accepted with a valid key');
+  const opBadKey = await post('/objectives', { title: 'auth-test' }, 'mk_bogus.deadbeef');
+  ok(opBadKey.status === 401, 'auth on: a bogus API key is rejected on operator endpoints');
   process.env.MOLT_AUTH = '0';
 
   console.log(`\nAll grid checks passed (${pass}).`);

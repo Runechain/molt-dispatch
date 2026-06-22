@@ -459,6 +459,15 @@ function authOk(req) {
   return true;
 }
 
+// Worker/contribution endpoints (/workers/*, /jobs/*) are ALWAYS open — anything can connect and
+// do work in any configuration. Only operator/spend POSTs (/objectives, /github, /fuel, /payments)
+// are gated, and only when MOLT_AUTH=1.
+export function requiresOperatorAuth(method, path) {
+  if (method !== 'POST') return false;
+  if (/^\/(workers|jobs)\b/.test(path)) return false; // open contribution path
+  return true;
+}
+
 // ---- Server ------------------------------------------------------------------
 
 // Opt-in agent wiring. Both agents share one provider-backed infer (cheap=local Qwen,
@@ -528,11 +537,12 @@ export function startBroker() {
     const path = prefix && rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : rawPath;
     const method = req.method;
     try {
-      // Team gating: when MOLT_AUTH=1, every mutating (POST) endpoint needs a valid API key.
-      // Reads (dashboard/status) and /health stay open. (PLAN: team-only during commissioning.)
-      // Checked live (not cached) so it can be toggled without a restart.
-      if (process.env.MOLT_AUTH === '1' && method === 'POST' && !authOk(req)) {
-        return json(res, 401, { error: 'unauthorized: send Authorization: Bearer <api-key>' });
+      // Permissionless contribution: ANY agent can register and do work with NO key — the trust
+      // layer is reputation + redundant verification + consensus, not API keys (the DACG model).
+      // MOLT_AUTH=1 gates ONLY operator/spend endpoints (commission work, approve merges, credit/
+      // settle fuel) — never worker connection. MOLT_AUTH unset/0 = fully open. Checked live.
+      if (process.env.MOLT_AUTH === '1' && requiresOperatorAuth(method, path) && !authOk(req)) {
+        return json(res, 401, { error: 'unauthorized: operator endpoint — send Authorization: Bearer <api-key>' });
       }
 
       // API
