@@ -23,9 +23,14 @@ export const PATHS = {
 export const BROKER = {
   host: process.env.MOLT_HOST || '127.0.0.1',
   port: Number(process.env.MOLT_PORT || 7077),
+  // MOLT_BROKER_URL overrides the computed URL — set on workers that connect to the
+  // deployed broker (e.g. MOLT_BROKER_URL=https://play.runechaingame.com/grid).
   get url() {
-    return `http://${this.host}:${this.port}`;
+    return process.env.MOLT_BROKER_URL || `http://${this.host}:${this.port}`;
   },
+  // Path prefix stripped by the broker before routing — set when behind an ALB path rule.
+  // e.g. MOLT_PATH_PREFIX=/grid means /grid/jobs -> /jobs internally.
+  pathPrefix: process.env.MOLT_PATH_PREFIX || '',
 };
 
 // Lease / scheduling defaults

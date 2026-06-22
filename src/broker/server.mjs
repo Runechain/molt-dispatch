@@ -7,7 +7,7 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
 import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
-import { BROKER, DEFAULTS, PATHS } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, FUEL } from '../shared/config.mjs';
 import { planObjective } from './planner.mjs';
 import { pickJob, workerOffersBedrock } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
@@ -424,8 +424,12 @@ function authOk(req) {
 export function startBroker() {
   getDb(); // bootstrap schema
   const server = http.createServer(async (req, res) => {
-    const url = new URL(req.url, BROKER.url);
-    const path = url.pathname;
+    const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
+    const rawPath = url.pathname;
+    // Strip the ALB path prefix so the router sees /health, /jobs, etc. regardless
+    // of whether the broker sits at / or /grid (MOLT_PATH_PREFIX=/grid).
+    const prefix = BROKER.pathPrefix;
+    const path = prefix && rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : rawPath;
     const method = req.method;
     try {
       // Team gating: when MOLT_AUTH=1, every mutating (POST) endpoint needs a valid API key.
