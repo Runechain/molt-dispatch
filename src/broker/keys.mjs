@@ -27,6 +27,27 @@ export function createKey({ name, scopes = 'dispatch,worker', accountId: acct } 
   return { id, secret, key: `${id}.${secret}`, account_id: account, scopes };
 }
 
+// Seed a PROVIDED key (`<id>.<secret>`) — the deployed-broker bootstrap path. The cloud broker's
+// DB lives on EFS and WAL mode can't be written by a second host, so a key can't be minted from
+// outside; instead the operator supplies MOLT_BOOTSTRAP_KEY and the broker seeds it on its own
+// boot (single writer, safe). Idempotent: a no-op if the id already exists. Only the sha256 of
+// the secret is stored.
+export function importKey(rawKey, { name = 'bootstrap', scopes = 'dispatch,worker', accountId: acct } = {}) {
+  const dot = String(rawKey || '').indexOf('.');
+  if (dot < 1) throw new Error('importKey: key must be "<id>.<secret>"');
+  const id = rawKey.slice(0, dot);
+  const secret = rawKey.slice(dot + 1);
+  if (!id || !secret) throw new Error('importKey: empty id or secret');
+  const d = getDb();
+  if (d.prepare('SELECT id FROM api_keys WHERE id=?').get(id)) return { id, seeded: false };
+  const account = acct || ensureAccount({ name, role: 'team' });
+  const hash = createHash('sha256').update(secret).digest('hex');
+  d.prepare('INSERT INTO api_keys(id, account_id, hash, name, scopes, revoked, created_at) VALUES(?,?,?,?,?,0,?)').run(
+    id, account, hash, name || null, scopes, now()
+  );
+  return { id, seeded: true, account_id: account };
+}
+
 export function listKeys() {
   return getDb()
     .prepare('SELECT id, account_id, name, scopes, last_used, revoked, created_at FROM api_keys ORDER BY created_at DESC')

@@ -17,6 +17,7 @@ import { listIssues } from './gh.mjs';
 import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor, clearObjectiveHold, clearNeedsReview, applyObjectiveGatingStatus } from './objective-deps.mjs';
 import { setIntegrationInfer } from './agents/integration-agent.mjs';
 import { setPlannerInfer } from './agents/planner-agent.mjs';
+import { importKey } from './keys.mjs';
 import { makeProviderInfer } from './agents/deliberate.mjs';
 import { getAdapter } from '../worker/adapters/index.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, estimateCost, chargeFuel, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
@@ -501,8 +502,22 @@ function maybeEnableAgents() {
   }
 }
 
+// Seed the team API key from MOLT_BOOTSTRAP_KEY on boot (the deployed-broker key bootstrap —
+// the EFS/WAL DB can't be written by an outside process). Idempotent; logs the id, never the secret.
+function seedBootstrapKey() {
+  const raw = process.env.MOLT_BOOTSTRAP_KEY;
+  if (!raw) return;
+  try {
+    const r = importKey(raw, { name: 'bootstrap' });
+    console.log(r.seeded ? `[broker] bootstrap API key seeded (id=${r.id})` : `[broker] bootstrap API key already present (id=${r.id})`);
+  } catch (e) {
+    console.log(`[broker] bootstrap key NOT seeded: ${e.message}`);
+  }
+}
+
 export function startBroker() {
   getDb(); // bootstrap schema
+  seedBootstrapKey();
   maybeEnableAgents();
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
