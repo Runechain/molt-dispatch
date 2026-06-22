@@ -121,13 +121,17 @@ try {
   const approved = await post(`/objectives/${objs[0].id}/approve`);
   ok(approved.body.status === 'approved', 'repo-less inference objective approves without merge');
 
-  // 9. Permissionless contribution: worker endpoints are ALWAYS open (anything can connect, no
-  //    key); MOLT_AUTH=1 gates ONLY operator/spend endpoints.
+  // 9. Auth posture. SAFE DEFAULT (no MOLT_OPEN_GRID): MOLT_AUTH=1 gates every mutating endpoint,
+  //    workers included. Opt-in MOLT_OPEN_GRID=1 opens worker endpoints but operator/spend stays gated.
   process.env.MOLT_AUTH = '1';
+  const workerGated = await post('/workers/register', { worker_id: 'worker-C', manifest: { capabilities: ['inference'] } });
+  ok(workerGated.status === 401, 'auth on (default): worker register requires a key');
+  process.env.MOLT_OPEN_GRID = '1';
   const workerOpen = await post('/workers/register', { worker_id: 'worker-C', manifest: { capabilities: ['inference'] } });
-  ok(workerOpen.status === 200, 'auth on: worker register is OPEN with no key (permissionless contribution)');
-  const opNoKey = await post('/objectives', { title: 'auth-test' });
-  ok(opNoKey.status === 401, 'auth on: operator endpoint (POST /objectives) rejected without a key (401)');
+  ok(workerOpen.status === 200, 'MOLT_OPEN_GRID=1: worker register opens (no key)');
+  const opStillGated = await post('/objectives', { title: 'auth-test' });
+  ok(opStillGated.status === 401, 'open grid still gates operator endpoint (POST /objectives)');
+  delete process.env.MOLT_OPEN_GRID;
   const k = createKey({ name: 'test' });
   const opWithKey = await post('/objectives', { title: 'auth-test' }, k.key);
   ok(opWithKey.status === 200, 'auth on: operator endpoint accepted with a valid key');

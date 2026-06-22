@@ -7,9 +7,16 @@ import { requiresOperatorAuth } from '../src/broker/server.mjs';
 let passed = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); passed++; console.log(`  ✓ ${msg}`); };
 
-console.log('open contribution — worker endpoints never require auth');
+console.log('contribution — SAFE DEFAULT: worker endpoints are gated unless explicitly opted in');
+delete process.env.MOLT_OPEN_GRID;
+for (const p of ['/workers/register', '/jobs/claim', '/jobs/J-1/result']) {
+  ok(requiresOperatorAuth('POST', p) === true, `default (no MOLT_OPEN_GRID): POST ${p} is GATED`);
+}
+
+console.log('contribution — MOLT_OPEN_GRID=1 opts worker endpoints open');
+process.env.MOLT_OPEN_GRID = '1';
 for (const p of ['/workers/register', '/workers/heartbeat', '/jobs/claim', '/jobs/J-1/result', '/jobs/J-1/checkpoint']) {
-  ok(requiresOperatorAuth('POST', p) === false, `POST ${p} is open (no key)`);
+  ok(requiresOperatorAuth('POST', p) === false, `opt-in: POST ${p} is open (no key)`);
 }
 
 console.log('open contribution — reads are never gated');

@@ -459,12 +459,14 @@ function authOk(req) {
   return true;
 }
 
-// Worker/contribution endpoints (/workers/*, /jobs/*) are ALWAYS open — anything can connect and
-// do work in any configuration. Only operator/spend POSTs (/objectives, /github, /fuel, /payments)
-// are gated, and only when MOLT_AUTH=1.
+// Worker/contribution endpoints (/workers/*, /jobs/*) are open ONLY under the explicit opt-in
+// MOLT_OPEN_GRID=1. The permissionless posture is UNSAFE until reviewer-independence, server-side
+// trust derivation, and per-worker identity land (security audit 2026-06-22: an anonymous worker
+// can otherwise forge a green review, self-grade, spoof trust/changed_files, and grief reputation).
+// So it defaults OFF — with MOLT_AUTH=1 every mutating endpoint, workers included, needs the key.
 export function requiresOperatorAuth(method, path) {
   if (method !== 'POST') return false;
-  if (/^\/(workers|jobs)\b/.test(path)) return false; // open contribution path
+  if (process.env.MOLT_OPEN_GRID === '1' && /^\/(workers|jobs)\b/.test(path)) return false;
   return true;
 }
 
