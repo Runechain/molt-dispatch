@@ -3,7 +3,7 @@
 // verdict parsing, and that every failure path fails SAFE to 'escalate'.
 
 import assert from 'node:assert/strict';
-import { deliberate, _internals } from '../src/broker/agents/deliberate.mjs';
+import { deliberate, _internals, makeProviderInfer } from '../src/broker/agents/deliberate.mjs';
 
 let passed = 0;
 const ok = (cond, msg) => {
@@ -91,6 +91,28 @@ console.log('deliberation DAG — guards');
   await assert.rejects(() => deliberate({ question: 'q', decisions: DECISIONS }), /infer function is required/, 'missing infer rejects');
   await assert.rejects(() => deliberate({ question: 'q', infer: async () => ({ text: '{}' }) }), /decisions\[\] is required/, 'missing decisions rejects');
   ok(true, 'required-arg guards enforced');
+}
+
+console.log('makeProviderInfer — premium budget gate + metering');
+{
+  const fakeAdapter = { run: async () => ({ status: 'completed', output: 'ok', provider: 'bedrock', model: 'm', usage: { input_tokens: 10, output_tokens: 20 } }) };
+  const getAdapter = () => fakeAdapter;
+
+  // Budget gate throws on PREMIUM only — so deliberate fails safe to escalate when out of budget.
+  const gated = makeProviderInfer({ getAdapter, tierAdapters: { cheap: 'c', premium: 'p' }, budgetGate: () => { throw new Error('insufficient fuel'); } });
+  await assert.rejects(() => gated({ tier: 'premium', prompt: 'x' }), /insufficient fuel/, 'premium call blocked when budget gate trips');
+  const cheap = await gated({ tier: 'cheap', prompt: 'x' });
+  ok(cheap.text === 'ok', 'cheap call is NOT budget-gated (free tier keeps flowing)');
+
+  // Meter fires after a successful premium call so internal agent spend hits the fuel ledger.
+  let metered = null;
+  const metering = makeProviderInfer({ getAdapter, tierAdapters: { cheap: 'c', premium: 'p' }, budgetGate: () => {}, meter: (m) => { metered = m; } });
+  await metering({ tier: 'premium', prompt: 'x' });
+  ok(metered && metered.provider === 'bedrock' && metered.usage.output_tokens === 20, 'premium call is metered (provider + usage) for fuel charging');
+  let cheapMetered = false;
+  const metering2 = makeProviderInfer({ getAdapter, tierAdapters: { cheap: 'c', premium: 'p' }, meter: () => { cheapMetered = true; } });
+  await metering2({ tier: 'cheap', prompt: 'x' });
+  ok(cheapMetered === false, 'cheap calls are not metered (only premium spend is charged)');
 }
 
 console.log(`\n✅ deliberation DAG: ${passed} checks passed`);

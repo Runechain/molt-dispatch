@@ -163,12 +163,17 @@ function transcriptOf(done) {
 // Maps the deliberation's tiers onto real grid providers: cheap -> local Qwen, premium ->
 // Bedrock (the funded judge). Injected getAdapter keeps the broker decoupled from the worker
 // provider registry. Not exercised by the $0 mock test — that injects its own infer.
-export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local', premium: 'bedrock' }, log = () => {} } = {}) {
+// budgetGate() is called before every PREMIUM-tier call and must throw when there is no budget
+// (so deliberate fails safe to 'escalate' and the planner falls back to the template). meter()
+// is called after a successful premium call so the broker can charge the fuel ledger — these
+// internal agent calls would otherwise be unmetered, unbounded premium spend.
+export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local', premium: 'bedrock' }, log = () => {}, budgetGate = null, meter = null } = {}) {
   if (typeof getAdapter !== 'function') throw new Error('makeProviderInfer: getAdapter is required');
   return async ({ tier, system, prompt }) => {
     const name = tierAdapters[tier] || tierAdapters.cheap;
     const adapter = getAdapter(name);
     if (!adapter) throw new Error(`makeProviderInfer: no adapter for tier "${tier}" (${name})`);
+    if (tier === 'premium' && typeof budgetGate === 'function') budgetGate(); // throws when out of budget
     const job = {
       type: 'inference',
       capability_required: 'inference',
@@ -178,6 +183,9 @@ export function makeProviderInfer({ getAdapter, tierAdapters = { cheap: 'local',
     const ctx = { log, signal: undefined, checkpoint: null, saveCheckpoint: null };
     const res = await adapter.run(job, ctx);
     if (res.status !== 'completed') throw new Error(`infer failed on ${name}: ${res.error || res.status}`);
+    if (tier === 'premium' && typeof meter === 'function') {
+      try { meter({ provider: res.provider, model: res.model, usage: res.usage || {} }); } catch { /* metering must never break a decision */ }
+    }
     return { text: res.output || '', usage: res.usage || {} };
   };
 }

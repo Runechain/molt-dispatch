@@ -80,4 +80,22 @@ console.log('planner agent — invalid output and absent agent fall back to the 
   ok(j2.length === 2, 'unconfigured agent → deterministic template fallback');
 }
 
+console.log('planner agent — a review whose impl was dropped becomes a root, not an orphan');
+{
+  // impl_x has an unschedulable capability → dropped; rev_x depended on it.
+  const ORPHAN = {
+    jobs: [
+      { key: 'impl_x', type: 'code.implementation', title: 'x', capability: 'bogus.capability', prompt: 'x', depends_on: [] },
+      { key: 'rev_x', type: 'code.review', title: 'review x', capability: 'code.review', prompt: 'check', depends_on: ['impl_x'] },
+    ],
+  };
+  pa.setPlannerInfer(async () => ({ text: JSON.stringify(ORPHAN) }));
+  const o = objRow({ planner: 'agent' });
+  await planObjective(o);
+  const jobs = jobsFor(o.id);
+  ok(jobs.length === 1 && jobs[0].job_key === 'rev_x', 'unschedulable impl dropped, review kept');
+  ok(jobs[0].status === 'pending', 'review with a dropped dep is born pending (root), not an edgeless blocked orphan');
+  ok(depsCount(o.id) === 0, 'no dangling job_dependencies row referencing a non-materialized job');
+}
+
 console.log(`\n✅ planner agent: ${passed} checks passed`);

@@ -107,4 +107,39 @@ console.log('integration agent — unconfigured falls back to the deterministic 
   ok(canClaim(jb) === true, 'dependent runs under the deterministic floor');
 }
 
+console.log('integration agent — dependent is PRE-HELD across the deliberation (no leak window)');
+{
+  const { A, B } = scenario();
+  let heldDuringJudge = null;
+  agent.setIntegrationInfer(async ({ role }) => {
+    if (role === 'judge') { heldDuringJudge = od.objectivesOnHold().has(B); return { text: JSON.stringify({ decision: 'release', confidence: 0.9, rationale: 'ok' }) }; }
+    return { text: 'arg' };
+  });
+  await agent.integrateUpstreamApproved(A);
+  ok(heldDuringJudge === true, 'dependent is held DURING deliberation, closing the TOCTOU window');
+  ok(od.objectivesOnHold().has(B) === false, 'release verdict clears the pre-hold afterward');
+}
+
+console.log('integration agent — operator release recovers an escalated dependent');
+{
+  const { A, B, jb } = scenario();
+  agent.setIntegrationInfer(mockInfer({ decision: 'escalate', escalate: true, escalateReason: 'conflict', confidence: 0.2 }));
+  await agent.integrateUpstreamApproved(A);
+  ok(canClaim(jb) === false && d.prepare('SELECT needs_review n FROM objectives WHERE id=?').get(B).n === 1, 'escalated: held + needs_review');
+  // Simulate POST /objectives/:id/release (the operator merged the upstream PR).
+  od.clearObjectiveHold(B); od.clearNeedsReview(B); od.applyObjectiveGatingStatus(B);
+  ok(d.prepare('SELECT needs_review n FROM objectives WHERE id=?').get(B).n === 0, 'release clears needs_review');
+  ok(canClaim(jb) === true, 'release re-enables the dependent — escape hatch works');
+}
+
+console.log('integration agent — hold does not drag a non-pre-terminal dependent backwards');
+{
+  const { A, B } = scenario();
+  d.prepare(`UPDATE objectives SET status='ready_for_approval' WHERE id=?`).run(B);
+  agent.setIntegrationInfer(mockInfer({ decision: 'hold', confidence: 0.4, rationale: 'wait' }));
+  await agent.integrateUpstreamApproved(A);
+  ok(d.prepare('SELECT status s FROM objectives WHERE id=?').get(B).s === 'ready_for_approval', 'ready_for_approval status preserved');
+  ok(od.objectivesOnHold().has(B) === true, 'but dep_hold still tightens the run-gate');
+}
+
 console.log(`\n✅ integration agent: ${passed} checks passed`);

@@ -163,11 +163,15 @@ async function planWithClaude(objective) {
 // llm planner and the agent planner; drops jobs whose capability the grid can't schedule, caps
 // at 8 units, and keeps only depends_on keys that exist in the plan.
 export function mapPlannedJobs(planJobs, contract = {}) {
-  const planned = [];
-  for (const j of planJobs.slice(0, 8)) {
-    if (!CAPABILITIES[j.capability]) continue;
+  // Compute the surviving jobs FIRST so depends_on can be filtered against keys that actually
+  // get materialized. Otherwise a job whose dependency was dropped (unschedulable capability /
+  // past the 8-cap) is born 'blocked' with no job_dependencies row — an orphan that never
+  // unblocks and wedges finalizeObjective.
+  const kept = planJobs.slice(0, 8).filter((j) => CAPABILITIES[j.capability]);
+  const keptKeys = new Set(kept.map((j) => j.key));
+  const planned = kept.map((j) => {
     const isImpl = j.capability === 'code.implementation' || j.capability === 'tests.unit';
-    planned.push({
+    return {
       key: j.key,
       type: j.type || (isImpl ? 'code.implementation' : 'code.review'),
       title: j.title,
@@ -175,9 +179,9 @@ export function mapPlannedJobs(planJobs, contract = {}) {
       adapter_hint: CAPABILITIES[j.capability],
       prompt: j.prompt || j.title,
       spec: isImpl ? implSpec(contract) : { rubric: j.capability === 'code.review' },
-      depends_on: (j.depends_on || []).filter((k) => planJobs.some((x) => x.key === k)),
-    });
-  }
+      depends_on: (j.depends_on || []).filter((k) => keptKeys.has(k)),
+    };
+  });
   return planned.length ? planned : null;
 }
 

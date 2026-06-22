@@ -210,6 +210,9 @@ export function clearObjectiveHold(objectiveId) {
 export function objectivesOnHold() {
   return new Set(getDb().prepare(`SELECT id FROM objectives WHERE dep_hold=1`).all().map((r) => r.id));
 }
+export function clearNeedsReview(objectiveId) {
+  getDb().prepare(`UPDATE objectives SET needs_review=0, updated_at=? WHERE id=?`).run(now(), objectiveId);
+}
 
 // Objectives that declare a (resolved, active) dependency on the given objective.
 export function objectivesDependingOn(objectiveId) {

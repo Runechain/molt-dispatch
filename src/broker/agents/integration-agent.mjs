@@ -23,6 +23,10 @@ import {
 
 let INFER = null;
 
+// Bound premium fan-out: at most this many full debates per approval event; beyond it, remaining
+// dependents are held (and surfaced) for later re-evaluation rather than each spending a debate.
+const MAX_DELIBERATIONS = Number(process.env.MOLT_MAX_DELIBERATIONS || 8);
+
 // Wire a real inference function (cheap+premium tiers) at broker start. Left null => the broker
 // falls back to the deterministic floor (release-on-approve). See makeProviderInfer in deliberate.mjs.
 export function setIntegrationInfer(fn) {
@@ -67,6 +71,7 @@ const QUESTION =
 // Returns a per-dependent decision summary.
 export async function integrateUpstreamApproved(upstreamId) {
   const results = [];
+  let deliberations = 0;
   for (const depId of objectivesDependingOn(upstreamId)) {
     // The floor still rules: if other upstreams aren't approved, the dependent isn't eligible yet.
     if (!objectiveDepsSatisfied(depId)) {
@@ -80,6 +85,18 @@ export async function integrateUpstreamApproved(upstreamId) {
       results.push({ dependent: depId, decision: 'release', reason: 'deterministic floor (integration agent not configured)' });
       continue;
     }
+    // PRE-HOLD across the (multi-second) deliberation. The floor gate opened the instant the
+    // upstream flipped to 'approved'; without this, a concurrent /jobs/claim could leak this
+    // dependent's jobs during the await. Held now, released only on a 'release' verdict.
+    setObjectiveHold(depId);
+
+    // Cost cap: beyond the fan-out limit, leave the dependent held + surfaced instead of debating.
+    if (deliberations >= MAX_DELIBERATIONS) {
+      logEvent('objective', depId, 'integration_deferred', { upstream: upstreamId, reason: 'deliberation cap reached' });
+      results.push({ dependent: depId, decision: 'hold', reason: 'deliberation cap reached — held for re-evaluation' });
+      continue;
+    }
+    deliberations++;
     let verdict;
     try {
       verdict = await deliberate({
@@ -113,14 +130,18 @@ function applyVerdict(depId, upstreamId, verdict) {
     logEvent('objective', depId, 'integration_release', { upstream: upstreamId, confidence: verdict.confidence, rationale: verdict.rationale });
     return;
   }
-  if (verdict.decision === 'escalate') {
-    setObjectiveHold(depId);
-    d.prepare(`UPDATE objectives SET needs_review=1, status='blocked', updated_at=? WHERE id=?`).run(now(), depId);
-    logEvent('objective', depId, 'integration_escalate', { upstream: upstreamId, reason: verdict.escalateReason, confidence: verdict.confidence });
-    return;
-  }
-  // hold
+  // hold or escalate: tighten the run-gate via dep_hold (unconditional). Only downgrade the
+  // DISPLAY status to 'blocked' if the dependent is still pre-terminal — never drag a
+  // ready_for_approval/approved dependent backwards.
   setObjectiveHold(depId);
-  d.prepare(`UPDATE objectives SET status='blocked', updated_at=? WHERE id=?`).run(now(), depId);
-  logEvent('objective', depId, 'integration_hold', { upstream: upstreamId, confidence: verdict.confidence, rationale: verdict.rationale });
+  const cur = d.prepare(`SELECT status FROM objectives WHERE id=?`).get(depId)?.status;
+  if (['planning', 'in_progress', 'blocked'].includes(cur)) {
+    d.prepare(`UPDATE objectives SET status='blocked', updated_at=? WHERE id=?`).run(now(), depId);
+  }
+  if (verdict.decision === 'escalate') {
+    d.prepare(`UPDATE objectives SET needs_review=1, updated_at=? WHERE id=?`).run(now(), depId);
+    logEvent('objective', depId, 'integration_escalate', { upstream: upstreamId, reason: verdict.escalateReason, confidence: verdict.confidence });
+  } else {
+    logEvent('objective', depId, 'integration_hold', { upstream: upstreamId, confidence: verdict.confidence, rationale: verdict.rationale });
+  }
 }

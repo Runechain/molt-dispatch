@@ -14,12 +14,12 @@ import { onResult } from './lifecycle.mjs';
 import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
-import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor } from './objective-deps.mjs';
+import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor, clearObjectiveHold, clearNeedsReview, applyObjectiveGatingStatus } from './objective-deps.mjs';
 import { setIntegrationInfer } from './agents/integration-agent.mjs';
 import { setPlannerInfer } from './agents/planner-agent.mjs';
 import { makeProviderInfer } from './agents/deliberate.mjs';
 import { getAdapter } from '../worker/adapters/index.mjs';
-import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
+import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, estimateCost, chargeFuel, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
 import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
 
 const json = (res, code, body) => {
@@ -351,6 +351,18 @@ function postPaymentsRequest(body) {
 
 // ---- Read endpoints (dashboard / CLI status) ---------------------------------
 
+// Force-clear an integration hold/escalation and re-gate. The human's lever once they've
+// resolved whatever the agent escalated (e.g. merged the upstream PR).
+function releaseObjective(objectiveId) {
+  const d = getDb();
+  if (!d.prepare('SELECT id FROM objectives WHERE id=?').get(objectiveId)) return { error: 'unknown objective', code: 404 };
+  clearObjectiveHold(objectiveId);
+  clearNeedsReview(objectiveId);
+  applyObjectiveGatingStatus(objectiveId);
+  logEvent('objective', objectiveId, 'integration_released_by_operator', {});
+  return { ok: true, objective_id: objectiveId, status: d.prepare('SELECT status FROM objectives WHERE id=?').get(objectiveId).status };
+}
+
 function listObjectives() {
   // Annotate with blocked_on — the operator's escape hatch when an objective is wedged behind
   // an upstream (never-approved, unresolved, or failed dependency). Empty array = not blocked.
@@ -456,8 +468,22 @@ function maybeEnableAgents() {
     cheap: process.env.MOLT_DELIB_CHEAP || 'local',
     premium: process.env.MOLT_DELIB_PREMIUM || 'bedrock',
   };
+  // Premium (Bedrock) deliberation/decomposition calls are broker-internal, not grid jobs — meter
+  // and budget-gate them against the same fuel ledger so they can't become unbounded spend. When
+  // the budget is exhausted, premium calls throw: deliberate fails safe to 'escalate', the planner
+  // falls back to the template.
+  const budgetGate = () => {
+    if (getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) throw new Error('insufficient fuel for premium agent call');
+  };
+  let meterSeq = 0;
+  const meter = ({ provider, model, usage }) => {
+    const inTok = usage.input_tokens ?? usage.tokens_in ?? 0;
+    const outTok = usage.output_tokens ?? usage.tokens_out ?? 500;
+    const cents = estimateCost(provider || 'bedrock', model || 'claude-3-haiku', inTok, outTok);
+    chargeFuel(PRIMARY_ACCOUNT, `agent-${now()}-${++meterSeq}`, cents, `agent premium call ${provider || '?'}/${model || '?'}`);
+  };
   let infer = null;
-  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, log: () => {} }));
+  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, log: () => {}, budgetGate, meter }));
   if (process.env.MOLT_INTEGRATION_AGENT === '1') {
     setIntegrationInfer(sharedInfer());
     console.log(`[broker] integration agent ON (cheap=${tierAdapters.cheap}, premium=${tierAdapters.premium})`);
@@ -508,6 +534,10 @@ export function startBroker() {
       }
       const approveMatch = path.match(/^\/objectives\/([^/]+)\/approve$/);
       if (method === 'POST' && approveMatch) { const r = await approveObjective(approveMatch[1]); return json(res, r.code || 200, r); }
+      // Operator escape hatch: force-release an objective the integration agent held/escalated
+      // (e.g. after the human merged the upstream PR). Clears dep_hold + needs_review and re-gates.
+      const releaseMatch = path.match(/^\/objectives\/([^/]+)\/release$/);
+      if (method === 'POST' && releaseMatch) { const r = releaseObjective(releaseMatch[1]); return json(res, r.code || 200, r); }
 
       // Fuel ledger
       if (method === 'GET' && path === '/fuel/balance') return json(res, 200, getFuelBalance(url.searchParams.get('account') || PRIMARY_ACCOUNT));
