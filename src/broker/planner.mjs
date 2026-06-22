@@ -10,6 +10,7 @@ import { jobId } from '../shared/ids.mjs';
 import { run } from '../shared/proc.mjs';
 import { extractJson } from '../shared/jsonout.mjs';
 import { PLAN_SCHEMA, validateAgainst } from '../shared/schema.mjs';
+import { decomposeWithAgent } from './agents/planner-agent.mjs';
 
 // Capabilities the grid can currently schedule, and which adapter serves each.
 const CAPABILITIES = {
@@ -23,7 +24,15 @@ const CAPABILITIES = {
 export async function planObjective(objective) {
   const mode = objective.contract?.planner || 'template';
   let planned;
-  if (mode === 'llm') {
+  if (mode === 'agent') {
+    // Logic-first, then the planner agent decomposes into the full file-scoped DAG.
+    const plan = await decomposeWithAgent(objective);
+    planned = plan?.jobs ? mapPlannedJobs(plan.jobs, objective.contract || {}) : null;
+    if (!planned || !planned.length) {
+      logEvent('objective', objective.id, 'planner_fallback', { reason: 'agent planner unavailable/failed; using template' });
+      planned = templatePlan(objective);
+    }
+  } else if (mode === 'llm') {
     planned = await planWithClaude(objective);
     if (!planned || !planned.length) {
       logEvent('objective', objective.id, 'planner_fallback', { reason: 'llm planner failed; using template' });
@@ -146,9 +155,16 @@ async function planWithClaude(objective) {
     return null;
   }
 
-  // Map planned jobs to internal form; drop jobs with capabilities we can't schedule.
+  // Map planned jobs to internal form (shared with the agent planner).
+  return mapPlannedJobs(plan.jobs, contract);
+}
+
+// Map a validated PLAN_SCHEMA job list to the broker's internal planned-job form. Shared by the
+// llm planner and the agent planner; drops jobs whose capability the grid can't schedule, caps
+// at 8 units, and keeps only depends_on keys that exist in the plan.
+export function mapPlannedJobs(planJobs, contract = {}) {
   const planned = [];
-  for (const j of plan.jobs.slice(0, 8)) {
+  for (const j of planJobs.slice(0, 8)) {
     if (!CAPABILITIES[j.capability]) continue;
     const isImpl = j.capability === 'code.implementation' || j.capability === 'tests.unit';
     planned.push({
@@ -159,7 +175,7 @@ async function planWithClaude(objective) {
       adapter_hint: CAPABILITIES[j.capability],
       prompt: j.prompt || j.title,
       spec: isImpl ? implSpec(contract) : { rubric: j.capability === 'code.review' },
-      depends_on: (j.depends_on || []).filter((k) => plan.jobs.some((x) => x.key === k)),
+      depends_on: (j.depends_on || []).filter((k) => planJobs.some((x) => x.key === k)),
     });
   }
   return planned.length ? planned : null;

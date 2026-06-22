@@ -16,6 +16,7 @@ import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
 import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor } from './objective-deps.mjs';
 import { setIntegrationInfer } from './agents/integration-agent.mjs';
+import { setPlannerInfer } from './agents/planner-agent.mjs';
 import { makeProviderInfer } from './agents/deliberate.mjs';
 import { getAdapter } from '../worker/adapters/index.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
@@ -283,6 +284,9 @@ async function importIssues(body) {
 function defaultIssueContract(testCmd) {
   return {
     objective_type: 'code.feature',
+    // Request agent decomposition (logic-first, then decompose). Falls back to the template when
+    // the planner agent isn't configured (MOLT_PLANNER_AGENT unset), so default behavior is safe.
+    planner: 'agent',
     hard_completion_gates: testCmd ? [`'${testCmd}' passes`] : ['implements the change described in the issue'],
     forbidden_without_approval: ['adding npm dependencies'],
     constraints: { max_files_changed: 20 },
@@ -444,22 +448,29 @@ function authOk(req) {
 
 // ---- Server ------------------------------------------------------------------
 
-// Opt-in (MOLT_INTEGRATION_AGENT=1): route dependency-release decisions through the deliberation
-// agent instead of the deterministic floor. Tiers default to local Qwen (cheap) / Bedrock
-// (premium); override with MOLT_DELIB_CHEAP / MOLT_DELIB_PREMIUM. Off by default — the floor runs.
-function maybeEnableIntegrationAgent() {
-  if (process.env.MOLT_INTEGRATION_AGENT !== '1') return;
+// Opt-in agent wiring. Both agents share one provider-backed infer (cheap=local Qwen,
+// premium=Bedrock; override via MOLT_DELIB_CHEAP / MOLT_DELIB_PREMIUM). Off by default — the
+// broker runs the deterministic floor + template planner unless explicitly enabled.
+function maybeEnableAgents() {
   const tierAdapters = {
     cheap: process.env.MOLT_DELIB_CHEAP || 'local',
     premium: process.env.MOLT_DELIB_PREMIUM || 'bedrock',
   };
-  setIntegrationInfer(makeProviderInfer({ getAdapter, tierAdapters, log: () => {} }));
-  console.log(`[broker] integration agent ON (cheap=${tierAdapters.cheap}, premium=${tierAdapters.premium})`);
+  let infer = null;
+  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, log: () => {} }));
+  if (process.env.MOLT_INTEGRATION_AGENT === '1') {
+    setIntegrationInfer(sharedInfer());
+    console.log(`[broker] integration agent ON (cheap=${tierAdapters.cheap}, premium=${tierAdapters.premium})`);
+  }
+  if (process.env.MOLT_PLANNER_AGENT === '1') {
+    setPlannerInfer(sharedInfer());
+    console.log(`[broker] planner agent ON (premium=${tierAdapters.premium})`);
+  }
 }
 
 export function startBroker() {
   getDb(); // bootstrap schema
-  maybeEnableIntegrationAgent();
+  maybeEnableAgents();
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
     const rawPath = url.pathname;
