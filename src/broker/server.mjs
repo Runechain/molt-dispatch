@@ -17,6 +17,7 @@ import { listIssues } from './gh.mjs';
 import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor, clearObjectiveHold, clearNeedsReview, applyObjectiveGatingStatus } from './objective-deps.mjs';
 import { setIntegrationInfer } from './agents/integration-agent.mjs';
 import { setPlannerInfer } from './agents/planner-agent.mjs';
+import { importKey } from './keys.mjs';
 import { makeProviderInfer } from './agents/deliberate.mjs';
 import { getAdapter } from '../worker/adapters/index.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, estimateCost, chargeFuel, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
@@ -458,6 +459,15 @@ function authOk(req) {
   return true;
 }
 
+// Worker/contribution endpoints (/workers/*, /jobs/*) are ALWAYS open — anything can connect and
+// do work in any configuration. Only operator/spend POSTs (/objectives, /github, /fuel, /payments)
+// are gated, and only when MOLT_AUTH=1.
+export function requiresOperatorAuth(method, path) {
+  if (method !== 'POST') return false;
+  if (/^\/(workers|jobs)\b/.test(path)) return false; // open contribution path
+  return true;
+}
+
 // ---- Server ------------------------------------------------------------------
 
 // Opt-in agent wiring. Both agents share one provider-backed infer (cheap=local Qwen,
@@ -501,8 +511,22 @@ function maybeEnableAgents() {
   }
 }
 
+// Seed the team API key from MOLT_BOOTSTRAP_KEY on boot (the deployed-broker key bootstrap —
+// the EFS/WAL DB can't be written by an outside process). Idempotent; logs the id, never the secret.
+function seedBootstrapKey() {
+  const raw = process.env.MOLT_BOOTSTRAP_KEY;
+  if (!raw) return;
+  try {
+    const r = importKey(raw, { name: 'bootstrap' });
+    console.log(r.seeded ? `[broker] bootstrap API key seeded (id=${r.id})` : `[broker] bootstrap API key already present (id=${r.id})`);
+  } catch (e) {
+    console.log(`[broker] bootstrap key NOT seeded: ${e.message}`);
+  }
+}
+
 export function startBroker() {
   getDb(); // bootstrap schema
+  seedBootstrapKey();
   maybeEnableAgents();
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
@@ -513,11 +537,12 @@ export function startBroker() {
     const path = prefix && rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : rawPath;
     const method = req.method;
     try {
-      // Team gating: when MOLT_AUTH=1, every mutating (POST) endpoint needs a valid API key.
-      // Reads (dashboard/status) and /health stay open. (PLAN: team-only during commissioning.)
-      // Checked live (not cached) so it can be toggled without a restart.
-      if (process.env.MOLT_AUTH === '1' && method === 'POST' && !authOk(req)) {
-        return json(res, 401, { error: 'unauthorized: send Authorization: Bearer <api-key>' });
+      // Permissionless contribution: ANY agent can register and do work with NO key — the trust
+      // layer is reputation + redundant verification + consensus, not API keys (the DACG model).
+      // MOLT_AUTH=1 gates ONLY operator/spend endpoints (commission work, approve merges, credit/
+      // settle fuel) — never worker connection. MOLT_AUTH unset/0 = fully open. Checked live.
+      if (process.env.MOLT_AUTH === '1' && requiresOperatorAuth(method, path) && !authOk(req)) {
+        return json(res, 401, { error: 'unauthorized: operator endpoint — send Authorization: Bearer <api-key>' });
       }
 
       // API
