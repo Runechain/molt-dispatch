@@ -15,6 +15,9 @@ import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
 import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor } from './objective-deps.mjs';
+import { setIntegrationInfer } from './agents/integration-agent.mjs';
+import { makeProviderInfer } from './agents/deliberate.mjs';
+import { getAdapter } from '../worker/adapters/index.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
 import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
 
@@ -441,8 +444,22 @@ function authOk(req) {
 
 // ---- Server ------------------------------------------------------------------
 
+// Opt-in (MOLT_INTEGRATION_AGENT=1): route dependency-release decisions through the deliberation
+// agent instead of the deterministic floor. Tiers default to local Qwen (cheap) / Bedrock
+// (premium); override with MOLT_DELIB_CHEAP / MOLT_DELIB_PREMIUM. Off by default — the floor runs.
+function maybeEnableIntegrationAgent() {
+  if (process.env.MOLT_INTEGRATION_AGENT !== '1') return;
+  const tierAdapters = {
+    cheap: process.env.MOLT_DELIB_CHEAP || 'local',
+    premium: process.env.MOLT_DELIB_PREMIUM || 'bedrock',
+  };
+  setIntegrationInfer(makeProviderInfer({ getAdapter, tierAdapters, log: () => {} }));
+  console.log(`[broker] integration agent ON (cheap=${tierAdapters.cheap}, premium=${tierAdapters.premium})`);
+}
+
 export function startBroker() {
   getDb(); // bootstrap schema
+  maybeEnableIntegrationAgent();
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
     const rawPath = url.pathname;

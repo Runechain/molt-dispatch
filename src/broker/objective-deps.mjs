@@ -197,6 +197,20 @@ export function unsatisfiedDepsFor(objectiveId) {
     .map((x) => ({ issue: x.issue, depends_on: x.dep, upstream_status: x.dep == null ? 'unresolved' : x.dep_status }));
 }
 
+// ---- Integration-agent run-gate (dep_hold) ---------------------------------
+// Distinct from the upstream-approval floor: the integration agent may HOLD a dependent's
+// release even though its upstreams are approved (e.g. an upstream PR isn't merged yet). The
+// scheduler unions this with objectivesWithUnsatisfiedDeps() so a held objective never runs.
+export function setObjectiveHold(objectiveId) {
+  getDb().prepare(`UPDATE objectives SET dep_hold=1, updated_at=? WHERE id=?`).run(now(), objectiveId);
+}
+export function clearObjectiveHold(objectiveId) {
+  getDb().prepare(`UPDATE objectives SET dep_hold=0, updated_at=? WHERE id=?`).run(now(), objectiveId);
+}
+export function objectivesOnHold() {
+  return new Set(getDb().prepare(`SELECT id FROM objectives WHERE dep_hold=1`).all().map((r) => r.id));
+}
+
 // Objectives that declare a (resolved, active) dependency on the given objective.
 export function objectivesDependingOn(objectiveId) {
   return getDb()

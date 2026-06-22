@@ -29,6 +29,9 @@ function migrate(d) {
   addCol('objectives', 'pr_url', 'pr_url TEXT');
   // Redundant verify: set when a low-rep worker's result needs a secondary check before approve.
   addCol('objectives', 'needs_review', 'needs_review INTEGER NOT NULL DEFAULT 0');
+  // Integration agent run-gate: set when the agent holds/escalates a dependent's release even
+  // though the deterministic floor is satisfied. The scheduler refuses to run a held objective.
+  addCol('objectives', 'dep_hold', 'dep_hold INTEGER NOT NULL DEFAULT 0');
   // Heterogeneous reputation: per (worker, capability, model/provider).
   addCol('reputation_events', 'model', 'model TEXT');
   addCol('reputation_events', 'provider', 'provider TEXT');
