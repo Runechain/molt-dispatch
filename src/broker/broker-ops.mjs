@@ -82,6 +82,10 @@ export async function approveObjective(objectiveId) {
   if (objective.status !== 'ready_for_approval') {
     return { error: `objective is '${objective.status}', not 'ready_for_approval'`, code: 409 };
   }
+  // Block approval when a low-rep worker's result needs a secondary review before fuel settles.
+  if (objective.needs_review) {
+    return { error: 'objective needs secondary review before approval (low-rep worker result)', code: 409, needs_review: true };
+  }
 
   const repo = objective.repo;
   if (!repo || !existsSync(repo)) {

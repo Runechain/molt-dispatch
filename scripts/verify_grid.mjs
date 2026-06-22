@@ -14,6 +14,7 @@ import assert from 'node:assert/strict';
 import { startBroker, sweepLeases } from '../src/broker/server.mjs';
 import { getDb, now } from '../src/broker/db.mjs';
 import { createKey } from '../src/broker/keys.mjs';
+import { creditFuel, PRIMARY_ACCOUNT } from '../src/broker/fuel.mjs';
 import { BROKER } from '../src/shared/config.mjs';
 
 const base = BROKER.url;
@@ -39,6 +40,9 @@ const server = startBroker();
 await new Promise((r) => setTimeout(r, 150)); // let it bind
 
 try {
+  // Fund the primary account so Bedrock workers can claim (Phase 2: budget gate).
+  creditFuel(PRIMARY_ACCOUNT, 500, 'grid-test seed balance');
+
   // Two heterogeneous workers, both inference-capable. B also advertises a bedrock model,
   // so continuation should prefer B (the funded backstop) and avoid A (the dropper).
   await post('/workers/register', {

@@ -44,7 +44,11 @@ export const AUTH = {
   header: 'authorization',
 };
 
-// Fuel / budget (Phase 2). Real spend stays behind a flag + a hard cap.
+// Fuel / budget. Real spend stays behind a flag + a hard cap.
+// Balance is denominated in USDC-cents (100 cents = $1.00).
 export const FUEL = {
-  real: process.env.MOLT_FUEL_REAL === '1', // false = simulated cents, no real spend
+  real: process.env.MOLT_FUEL_REAL === '1',           // false = simulated, no real spend
+  primaryAccount: 'acct_primary',                     // well-known team account id
+  repThreshold: Number(process.env.MOLT_REP_THRESHOLD || 0.4), // below this = low-rep = redundant verify
+  minBalance: Number(process.env.MOLT_MIN_BALANCE || 1), // minimum cents to dispatch a paid (Bedrock) job
 };

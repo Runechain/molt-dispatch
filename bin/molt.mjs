@@ -274,6 +274,36 @@ switch (cmd) {
     break;
   }
 
+  case 'fuel': {
+    const { flags, positional } = parseFlags(rest);
+    const account = flags.account || 'acct_primary';
+    if (sub === 'balance') {
+      const out = await api('GET', `/fuel/balance?account=${account}`);
+      console.log(`balance: ${out.balance_cents} cents  (account ${out.account_id})`);
+    } else if (sub === 'credit') {
+      const cents = Number(positional[0]);
+      if (!cents || cents <= 0) {
+        console.error('usage: molt fuel credit <cents> [--note "..."] [--account acct_primary]');
+        process.exit(1);
+      }
+      const out = await api('POST', '/fuel/credit', { amount_cents: cents, note: flags.note, account_id: account });
+      if (out.error) { console.error(`credit failed: ${out.error}`); process.exit(1); }
+      console.log(`credited ${cents} cents -> balance now ${out.balance_cents} cents`);
+    } else if (sub === 'log') {
+      const limit = flags.limit ? Number(flags.limit) : 20;
+      const rows = await api('GET', `/fuel/log?account=${account}&limit=${limit}`);
+      if (!rows.length) { console.log('(empty ledger)'); break; }
+      for (const r of rows) {
+        const sign = r.amount_cents > 0 ? '+' : '';
+        console.log(`  ${r.id}  ${r.op.padEnd(8)} ${sign}${r.amount_cents}c  ${r.job_id || '—'}  ${r.note || ''}`);
+      }
+    } else {
+      console.error('usage: molt fuel balance|credit|log');
+      process.exit(1);
+    }
+    break;
+  }
+
   case 'dashboard': {
     const url = `${BROKER.url}/dashboard`;
     console.log(`Opening ${url}`);
@@ -297,12 +327,16 @@ function usage() {
   molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH] [--plan llm]
   molt objective create -f <spec.json>
   molt key create [--name WHO] [--scopes dispatch,worker]   |   molt key list   |   molt key revoke <id>
+  molt fuel balance [--account acct_primary]
+  molt fuel credit <cents> [--note TEXT] [--account acct_primary]
+  molt fuel log [--limit N] [--account acct_primary]
   molt github import-issues --repo <path> [--label L] [--limit N] [--test "npm test"]
   molt approve <objective-id>        (github repo -> opens a PR; local repo -> merges)
   molt status [objective-id]
   molt dashboard
 
   env: MOLT_API_KEY (client auth), MOLT_OPENAI_BASE/MODEL (local provider), MOLT_BEDROCK_REGION/MODEL + AWS creds
+       MOLT_FUEL_REAL=1 (real x402 spend), MOLT_REP_THRESHOLD (default 0.4), MOLT_MIN_BALANCE (default 1 cent)
 `);
   process.exit(1);
 }

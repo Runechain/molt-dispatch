@@ -2,13 +2,14 @@
 // WHITEPAPER §6. Here we run it job-side: given a claiming worker, pick its best job.
 
 import { getDb } from './db.mjs';
-import { DEFAULTS } from '../shared/config.mjs';
+import { DEFAULTS, FUEL } from '../shared/config.mjs';
 import { trustScore } from './reputation.mjs';
+import { getBalance, PRIMARY_ACCOUNT } from './fuel.mjs';
 
 const ONLINE_MS = DEFAULTS.heartbeatSeconds * 1000 * 3; // treat a worker offline after 3 missed beats
 
 // Does a worker advertise the AWS Bedrock provider? (the funded continuation backstop)
-function workerOffersBedrock(workerId) {
+export function workerOffersBedrock(workerId) {
   const row = getDb().prepare('SELECT manifest_json FROM workers WHERE id=?').get(workerId);
   if (!row?.manifest_json) return false;
   try {
@@ -53,6 +54,11 @@ export function claimableJobsFor(worker) {
     // SOFT-as-HARD: don't re-hand a dropped job to the worker that dropped it IF someone
     // else can take it (continuation handoff). If it's the only option, let it through.
     if (job.last_failed_worker_id && job.last_failed_worker_id === worker.id && otherCapableWorkerOnline(job, worker.id)) {
+      continue;
+    }
+    // HARD: if the claiming worker uses Bedrock (a paid provider), the team account must have
+    // sufficient balance. budget=0 => only free/local agents run. (PLAN Phase 2: burn->fuel.)
+    if (workerOffersBedrock(worker.id) && getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) {
       continue;
     }
     // HARD: all dependencies accepted

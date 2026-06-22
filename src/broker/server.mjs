@@ -9,11 +9,13 @@ import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
 import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
 import { BROKER, DEFAULTS, PATHS } from '../shared/config.mjs';
 import { planObjective } from './planner.mjs';
-import { pickJob } from './scheduler.mjs';
+import { pickJob, workerOffersBedrock } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
 import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
+import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
+import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'content-type': 'application/json' });
@@ -86,6 +88,18 @@ function claim(body) {
     ).run(job.id, worker.id, 'running', token, now());
     d.prepare('UPDATE workers SET active_slots = active_slots + 1 WHERE id = ?').run(worker.id);
   });
+
+  // Reserve fuel for paid (Bedrock) workers at claim time.
+  // If balance is insufficient, pickJob already excluded the job — this is belt-and-suspenders.
+  if (workerOffersBedrock(worker.id)) {
+    const bedrockModel = (() => {
+      try {
+        const models = JSON.parse(d.prepare('SELECT manifest_json FROM workers WHERE id=?').get(worker.id)?.manifest_json || '{}').models || [];
+        return (models.find((m) => m.provider === 'bedrock') || {}).model || 'claude-3-haiku';
+      } catch { return 'claude-3-haiku'; }
+    })();
+    reserveFuel(PRIMARY_ACCOUNT, job.id, estimateJobCost(job, 'bedrock', bedrockModel));
+  }
 
   const objective = parseRow(d.prepare('SELECT * FROM objectives WHERE id=?').get(job.objective_id), ['contract_json']);
   const spec = job.spec_json ? JSON.parse(job.spec_json) : {};
@@ -259,6 +273,60 @@ function defaultIssueContract(testCmd) {
   };
 }
 
+// ---- Fuel ledger endpoints ---------------------------------------------------
+
+function getFuelBalance(accountId = PRIMARY_ACCOUNT) {
+  return { account_id: accountId, balance_cents: getBalance(accountId) };
+}
+
+function postFuelCredit(body) {
+  const amountCents = Number(body.amount_cents);
+  if (!Number.isFinite(amountCents) || amountCents <= 0) {
+    return { error: 'amount_cents must be a positive number', code: 400 };
+  }
+  const accountId = body.account_id || PRIMARY_ACCOUNT;
+  creditFuel(accountId, amountCents, body.note || null);
+  return { ok: true, account_id: accountId, credited_cents: amountCents, balance_cents: getBalance(accountId) };
+}
+
+function getFuelLog(accountId = PRIMARY_ACCOUNT, limit = 50) {
+  return fuelLog(accountId, limit);
+}
+
+// ---- Payment endpoints (x402 value rail) -------------------------------------
+
+// POST /payments/verify — verify an incoming x402 payment against requirements and, if valid,
+// credit the payer's account balance (or grant access to the paid resource).
+// With MOLT_FUEL_REAL=0, facilitator calls are simulated — no real on-chain action occurs.
+async function postPaymentsVerify(body) {
+  const { payment_header, payment_requirements } = body;
+  if (!payment_header || !payment_requirements) {
+    return { error: 'payment_header and payment_requirements required', code: 400 };
+  }
+  const result = await verifyPayment(payment_header, payment_requirements);
+  if (!result.isValid) {
+    return { error: `payment invalid: ${result.invalidReason || 'rejected by facilitator'}`, code: 402 };
+  }
+  // Settle on-chain (no-op when MOLT_FUEL_REAL=0).
+  await settlePayment(payment_header, payment_requirements);
+  return { ok: true, settled: !result.simulated, simulated: result.simulated ?? false };
+}
+
+// POST /payments/request — contributor requests payout for an accepted job.
+// Records a pending payout entry in the fuel ledger; actual USDC transfer is human-operated.
+function postPaymentsRequest(body) {
+  const { job_id, wallet_address, amount_cents } = body;
+  if (!job_id || !wallet_address) {
+    return { error: 'job_id and wallet_address required', code: 400 };
+  }
+  const d = getDb();
+  const job = d.prepare('SELECT * FROM jobs WHERE id=? AND status=?').get(job_id, 'accepted');
+  if (!job) return { error: 'job not found or not accepted', code: 404 };
+  const cents = Number(amount_cents) || 0;
+  recordPayout(PRIMARY_ACCOUNT, job_id, cents, wallet_address);
+  return { ok: true, job_id, wallet_address, amount_cents: cents, note: 'pending human/treasury disbursement' };
+}
+
 // ---- Read endpoints (dashboard / CLI status) ---------------------------------
 
 function listObjectives() {
@@ -302,6 +370,8 @@ export function sweepLeases() {
       d.prepare('UPDATE workers SET active_slots = MAX(0, active_slots - 1) WHERE id=?').run(job.assigned_worker_id);
       recordEvent(job.assigned_worker_id, job.capability_required, 'lease_expired', job.id);
     }
+    // Refund any fuel reserved by the dropped worker so the balance is available for the next.
+    refundFuel(PRIMARY_ACCOUNT, job.id);
     logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id, resumable: !!latestCheckpoint(job.id) });
   }
 }
@@ -385,7 +455,16 @@ export function startBroker() {
         return json(res, r.code || 200, r);
       }
       const approveMatch = path.match(/^\/objectives\/([^/]+)\/approve$/);
-      if (method === 'POST' && approveMatch) return json(res, 200, await approveObjective(approveMatch[1]));
+      if (method === 'POST' && approveMatch) { const r = await approveObjective(approveMatch[1]); return json(res, r.code || 200, r); }
+
+      // Fuel ledger
+      if (method === 'GET' && path === '/fuel/balance') return json(res, 200, getFuelBalance(url.searchParams.get('account') || PRIMARY_ACCOUNT));
+      if (method === 'GET' && path === '/fuel/log') return json(res, 200, getFuelLog(url.searchParams.get('account') || PRIMARY_ACCOUNT, Number(url.searchParams.get('limit') || 50)));
+      if (method === 'POST' && path === '/fuel/credit') { const r = postFuelCredit(await readBody(req)); return json(res, r.code || 200, r); }
+
+      // Payments (x402 value rail)
+      if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(await readBody(req)); return json(res, r.code || 200, r); }
+      if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(await readBody(req)); return json(res, r.code || 200, r); }
 
       if (method === 'GET' && path === '/objectives') return json(res, 200, listObjectives());
       if (method === 'GET' && path === '/jobs') return json(res, 200, listJobs(url.searchParams.get('objective')));

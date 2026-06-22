@@ -41,3 +41,7 @@ export function apiKeySecret() {
 export function checkpointId() {
   return `ck_${randomBytes(6).toString('hex')}`;
 }
+
+export function fuelLedgerId() {
+  return `fl_${randomBytes(6).toString('hex')}`;
+}

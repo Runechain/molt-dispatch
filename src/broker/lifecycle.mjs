@@ -4,7 +4,9 @@
 
 import { getDb, now, logEvent, parseRow } from './db.mjs';
 import { validateResult } from './validator.mjs';
-import { recordEvent } from './reputation.mjs';
+import { recordEvent, trustScore } from './reputation.mjs';
+import { chargeFuel, refundFuel, estimateCost, PRIMARY_ACCOUNT } from './fuel.mjs';
+import { FUEL } from '../shared/config.mjs';
 
 const MAX_ATTEMPTS = 2; // retry-once, then reject (default_on_failure §12)
 
@@ -49,21 +51,43 @@ function acceptJob(job, result = {}) {
   const meta = { model: result.model, provider: result.provider };
   setJobStatus(job.id, 'accepted');
   recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id, meta);
-  // If this job had been dropped before (a checkpoint or prior attempt), the worker that
-  // carried it across the line earns a resilience credit (PLAN: reward successful resumes).
   if ((job.checkpoint_seq || 0) > 0 || (job.attempts || 0) > 0) {
     recordEvent(job.assigned_worker_id, job.capability_required, 'resumed_successfully', job.id, meta);
   }
+
+  // Settle fuel: charge the actual cost (or estimate) for paid (Bedrock) jobs.
+  // Low-rep workers get their fuel held pending a secondary review before it settles.
+  if (result.provider === 'bedrock') {
+    const inputTokens = result.tokens_in ?? Math.ceil((job.prompt || '').length / 4);
+    const outputTokens = result.tokens_out ?? 500;
+    const actualCents = estimateCost(result.provider, result.model || 'claude-3-haiku', inputTokens, outputTokens);
+    const rep = trustScore(job.assigned_worker_id, job.capability_required);
+    if (rep < FUEL.repThreshold) {
+      markNeedsReview(job.objective_id, job.id, actualCents);
+    } else {
+      chargeFuel(PRIMARY_ACCOUNT, job.id, actualCents, `${result.provider}/${result.model || '?'}`);
+    }
+  }
+
   logEvent('job', job.id, 'accepted', { worker: job.assigned_worker_id, model: result.model, provider: result.provider });
   releaseAssignment(job.id, 'accepted');
   unlockDependents(job.id);
   finalizeObjective(job.objective_id);
 }
 
+// Mark an objective as needing a secondary review before approval (and before fuel settles).
+// The pending_fuel_cents is stored in the note so the approve path can charge it on clearance.
+function markNeedsReview(objectiveId, jobId, pendingFuelCents = 0) {
+  const d = getDb();
+  d.prepare('UPDATE objectives SET needs_review=1, updated_at=? WHERE id=?').run(now(), objectiveId);
+  logEvent('objective', objectiveId, 'needs_review', { job: jobId, pending_fuel_cents: pendingFuelCents });
+}
+
 function rejectOrRetry(job, reasons, result = {}) {
   const attempts = (job.attempts || 0) + 1;
+  // Refund any reserved fuel on every reject/retry path.
+  refundFuel(PRIMARY_ACCOUNT, job.id);
   if (attempts < MAX_ATTEMPTS) {
-    // retry: put it back in the pool, clear the lease (§12 retry-once).
     setJobStatus(job.id, 'pending', {
       attempts,
       lease_token: null,

@@ -27,12 +27,42 @@ function migrate(d) {
   };
   addCol('objectives', 'source_issue', 'source_issue INTEGER');
   addCol('objectives', 'pr_url', 'pr_url TEXT');
+  // Redundant verify: set when a low-rep worker's result needs a secondary check before approve.
+  addCol('objectives', 'needs_review', 'needs_review INTEGER NOT NULL DEFAULT 0');
   // Heterogeneous reputation: per (worker, capability, model/provider).
   addCol('reputation_events', 'model', 'model TEXT');
   addCol('reputation_events', 'provider', 'provider TEXT');
   // Fault tolerance: remember who dropped a job so continuation avoids re-handing it.
   addCol('jobs', 'last_failed_worker_id', 'last_failed_worker_id TEXT');
   addCol('jobs', 'checkpoint_seq', 'checkpoint_seq INTEGER DEFAULT 0');
+  // Ensure the primary team account exists for the fuel ledger.
+  ensurePrimaryAccount(d);
+  // Seed cost model with known Bedrock pricing (INSERT OR IGNORE).
+  seedCostModel(d);
+}
+
+function ensurePrimaryAccount(d) {
+  d.prepare(
+    `INSERT INTO accounts(id, name, role, balance_cents, status, created_at)
+     VALUES(?,?,?,?,?,?)
+     ON CONFLICT(id) DO NOTHING`
+  ).run('acct_primary', 'Team (primary)', 'team', 0, 'active', Date.now());
+}
+
+function seedCostModel(d) {
+  const ins = d.prepare(
+    `INSERT OR IGNORE INTO cost_model(id, provider, model, input_cents_per_1k, output_cents_per_1k, flat_cents, created_at)
+     VALUES(?,?,?,?,?,?,?)`
+  );
+  const t = Date.now();
+  // Bedrock prices (USD per 1M tokens → cents per 1k tokens):
+  //   claude-3-haiku:   $0.25/1M in  $1.25/1M out  → 0.025 / 0.125 cents per 1k
+  //   claude-sonnet:    $3.00/1M in  $15.00/1M out  → 0.3   / 1.5   cents per 1k
+  ins.run('cm_haiku',    'bedrock', 'claude-3-haiku',                              0.025, 0.125, 0, t);
+  ins.run('cm_haiku3v',  'bedrock', 'anthropic.claude-3-haiku-20240307-v1:0',      0.025, 0.125, 0, t);
+  ins.run('cm_sonnet46', 'bedrock', 'anthropic.claude-sonnet-4-6',                 0.3,   1.5,   0, t);
+  ins.run('cm_local',    'local',   '*',                                            0,     0,     0, t);
+  ins.run('cm_mock',     'mock',    'mock-1',                                       0,     0,     0, t);
 }
 
 function bootstrap(d) {
@@ -178,6 +208,31 @@ function bootstrap(d) {
       last_used INTEGER,
       revoked INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
+    );
+
+    -- Fuel ledger: every reserve/charge/refund/credit/payout in one append-only log.
+    -- amount_cents > 0 = inflow (credit/refund), amount_cents < 0 = outflow (reserve/charge/payout).
+    -- Balance = SUM(amount_cents) per account.
+    CREATE TABLE IF NOT EXISTS fuel_ledger (
+      id TEXT PRIMARY KEY,
+      account_id TEXT NOT NULL REFERENCES accounts(id),
+      job_id TEXT REFERENCES jobs(id),
+      op TEXT NOT NULL,         -- reserve|charge|refund|credit|payout
+      amount_cents INTEGER NOT NULL,
+      note TEXT,
+      created_at INTEGER NOT NULL
+    );
+
+    -- Cost model: cents per 1k tokens per (provider, model). model='*' = wildcard for a provider.
+    CREATE TABLE IF NOT EXISTS cost_model (
+      id TEXT PRIMARY KEY,
+      provider TEXT NOT NULL,
+      model TEXT NOT NULL,
+      input_cents_per_1k REAL NOT NULL DEFAULT 0,
+      output_cents_per_1k REAL NOT NULL DEFAULT 0,
+      flat_cents REAL NOT NULL DEFAULT 0,
+      created_at INTEGER NOT NULL,
+      UNIQUE(provider, model)
     );
   `);
 }
