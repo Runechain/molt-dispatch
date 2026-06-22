@@ -29,6 +29,9 @@ function migrate(d) {
   addCol('objectives', 'pr_url', 'pr_url TEXT');
   // Redundant verify: set when a low-rep worker's result needs a secondary check before approve.
   addCol('objectives', 'needs_review', 'needs_review INTEGER NOT NULL DEFAULT 0');
+  // Integration agent run-gate: set when the agent holds/escalates a dependent's release even
+  // though the deterministic floor is satisfied. The scheduler refuses to run a held objective.
+  addCol('objectives', 'dep_hold', 'dep_hold INTEGER NOT NULL DEFAULT 0');
   // Heterogeneous reputation: per (worker, capability, model/provider).
   addCol('reputation_events', 'model', 'model TEXT');
   addCol('reputation_events', 'provider', 'provider TEXT');
@@ -114,6 +117,19 @@ function bootstrap(d) {
       job_id TEXT NOT NULL REFERENCES jobs(id),
       depends_on_job_id TEXT NOT NULL REFERENCES jobs(id),
       PRIMARY KEY (job_id, depends_on_job_id)
+    );
+
+    -- Inter-objective dependencies (cross-issue "Depends on #N"). depends_on_objective_id is
+    -- NULL until the upstream issue is imported and resolveAndGate() binds it; depends_on_issue
+    -- keeps the raw GitHub issue number so forward/out-of-batch refs resolve later. status:
+    -- 'active' = enforced, 'cycle' = a back-edge dropped by cycle detection (never enforced).
+    CREATE TABLE IF NOT EXISTS objective_dependencies (
+      objective_id TEXT NOT NULL REFERENCES objectives(id),
+      depends_on_objective_id TEXT REFERENCES objectives(id),
+      depends_on_issue INTEGER NOT NULL,
+      status TEXT NOT NULL DEFAULT 'active',
+      created_at INTEGER NOT NULL,
+      PRIMARY KEY (objective_id, depends_on_issue)
     );
 
     CREATE TABLE IF NOT EXISTS workers (

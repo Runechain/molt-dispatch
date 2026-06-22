@@ -7,6 +7,7 @@ import { validateResult } from './validator.mjs';
 import { recordEvent, trustScore } from './reputation.mjs';
 import { chargeFuel, refundFuel, estimateCost, PRIMARY_ACCOUNT } from './fuel.mjs';
 import { FUEL } from '../shared/config.mjs';
+import { onUpstreamFailed } from './objective-deps.mjs';
 
 const MAX_ATTEMPTS = 2; // retry-once, then reject (default_on_failure §12)
 
@@ -155,4 +156,6 @@ function failObjective(objectiveId, reason) {
     .prepare('UPDATE objectives SET status = ?, updated_at = ? WHERE id = ?')
     .run('failed', now(), objectiveId);
   logEvent('objective', objectiveId, 'failed', { reason });
+  // Surface (don't cascade-fail) any dependents wedged on this objective.
+  onUpstreamFailed(objectiveId);
 }

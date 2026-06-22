@@ -5,6 +5,7 @@ import { getDb } from './db.mjs';
 import { DEFAULTS, FUEL } from '../shared/config.mjs';
 import { trustScore } from './reputation.mjs';
 import { getBalance, PRIMARY_ACCOUNT } from './fuel.mjs';
+import { objectivesWithUnsatisfiedDeps, objectivesOnHold } from './objective-deps.mjs';
 
 const ONLINE_MS = DEFAULTS.heartbeatSeconds * 1000 * 3; // treat a worker offline after 3 missed beats
 
@@ -45,8 +46,17 @@ export function claimableJobsFor(worker) {
     .prepare(`SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority ASC, created_at ASC`)
     .all();
 
+  // Cross-objective gate, computed once: objectives whose upstream dependency objectives are
+  // not yet 'approved' (floor), unioned with objectives the integration agent is holding.
+  // Their jobs are never handed out, no matter how ready the job itself is.
+  const objBlocked = objectivesWithUnsatisfiedDeps();
+  const objHeld = objectivesOnHold();
+
   const feasible = [];
   for (const job of pending) {
+    // HARD: inter-objective dependency — refuse to distribute B's work until A is satisfied
+    // AND the integration agent has not held/escalated B's release.
+    if (objBlocked.has(job.objective_id) || objHeld.has(job.objective_id)) continue;
     // HARD: capability
     if (job.capability_required && !caps.has(job.capability_required)) continue;
     // HARD: trust tier

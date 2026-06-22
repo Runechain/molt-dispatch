@@ -8,6 +8,15 @@ import { getDb, now, logEvent, parseRow } from './db.mjs';
 import { PATHS } from '../shared/config.mjs';
 import { run } from '../shared/proc.mjs';
 import { chooseIntegration, githubSlug, push, createPR } from './gh.mjs';
+import { onUpstreamApproved } from './objective-deps.mjs';
+import { integrationConfigured, integrateUpstreamApproved } from './agents/integration-agent.mjs';
+
+// Re-gate objectives waiting on the just-approved one. When the integration agent is configured
+// it deliberates release/hold/escalate per dependent; otherwise the deterministic floor releases.
+async function reGateDependents(objectiveId) {
+  if (integrationConfigured()) return await integrateUpstreamApproved(objectiveId);
+  return { upstream: objectiveId, dependents: onUpstreamApproved(objectiveId).map((id) => ({ dependent: id, decision: 'release' })) };
+}
 
 function git(dir, args, opts = {}) {
   return run('git', ['-C', dir, ...args], opts);
@@ -91,7 +100,8 @@ export async function approveObjective(objectiveId) {
   if (!repo || !existsSync(repo)) {
     d.prepare('UPDATE objectives SET status=?, updated_at=? WHERE id=?').run('approved', now(), objectiveId);
     logEvent('objective', objectiveId, 'approved', { note: 'no repo on disk' });
-    return { ok: true, objective_id: objectiveId, status: 'approved', merged: [] };
+    const unblocked = await reGateDependents(objectiveId);
+    return { ok: true, objective_id: objectiveId, status: 'approved', merged: [], unblocked };
   }
 
   const implJobs = d
@@ -108,7 +118,9 @@ export async function approveObjective(objectiveId) {
   for (const job of implJobs) await removeWorktree(job).catch(() => {});
   d.prepare('UPDATE objectives SET status=?, pr_url=?, updated_at=? WHERE id=?').run('approved', result.pr_url || null, now(), objectiveId);
   logEvent('objective', objectiveId, 'approved', { mode, ...result });
-  return { ok: true, objective_id: objectiveId, status: 'approved', mode, ...result };
+  // Re-gate any objectives that were waiting on this one.
+  const unblocked = await reGateDependents(objectiveId);
+  return { ok: true, objective_id: objectiveId, status: 'approved', mode, unblocked, ...result };
 }
 
 // Local mode: merge each accepted impl branch straight into the base branch.
