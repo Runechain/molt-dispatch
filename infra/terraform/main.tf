@@ -91,7 +91,7 @@ resource "aws_efs_access_point" "molt_data" {
 # EFS SG: accepts NFS (2049) only from the broker task SG.
 resource "aws_security_group" "efs" {
   name        = "molt-efs-sg"
-  description = "molt-broker EFS — NFS from broker task only"
+  description = "molt-broker EFS - NFS from broker task only"
   vpc_id      = var.vpc_id
   tags        = var.tags
 }
@@ -122,7 +122,7 @@ resource "aws_efs_mount_target" "molt_data" {
 
 resource "aws_security_group" "broker" {
   name        = "molt-broker-sg"
-  description = "molt-broker ECS task — accepts broker port from ALB only"
+  description = "molt-broker ECS task - accepts broker port from ALB only"
   vpc_id      = var.vpc_id
   tags        = var.tags
 }
