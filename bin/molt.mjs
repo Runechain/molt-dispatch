@@ -251,6 +251,18 @@ switch (cmd) {
     break;
   }
 
+  case 'release': {
+    const id = sub;
+    if (!id) {
+      console.error('usage: molt release <objective-id>   (clear an integration hold/escalation and re-gate)');
+      process.exit(1);
+    }
+    const out = await api('POST', `/objectives/${id}/release`);
+    if (out.error) console.error(`release failed: ${out.error}`);
+    else console.log(`Objective ${id} released -> ${out.status}`);
+    break;
+  }
+
   case 'status': {
     const objectives = await api('GET', '/objectives');
     const workers = await api('GET', '/workers');
@@ -332,6 +344,7 @@ function usage() {
   molt fuel log [--limit N] [--account acct_primary]
   molt github import-issues --repo <path> [--label L] [--limit N] [--test "npm test"]
   molt approve <objective-id>        (github repo -> opens a PR; local repo -> merges)
+  molt release <objective-id>        (clear an integration agent hold/escalation, re-gate)
   molt status [objective-id]
   molt dashboard
 
