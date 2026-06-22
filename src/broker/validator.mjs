@@ -8,7 +8,20 @@
 // worktree on disk). validateResult returns a verdict the lifecycle consumes.
 
 import { getDb, now } from './db.mjs';
-import { RESULT_ENVELOPE_SCHEMA, validateAgainst } from '../shared/schema.mjs';
+import { RESULT_ENVELOPE_SCHEMA, REVIEW_RUBRIC_SCHEMA, validateAgainst } from '../shared/schema.mjs';
+
+// Workers that authored an implementation this review job depends on (from the assignment record).
+function implAuthorsOf(reviewJobId) {
+  return getDb()
+    .prepare(
+      `SELECT DISTINCT j.assigned_worker_id AS w FROM job_dependencies jd
+         JOIN jobs j ON j.id = jd.depends_on_job_id
+        WHERE jd.job_id = ? AND j.type = 'code.implementation'`
+    )
+    .all(reviewJobId)
+    .map((r) => r.w)
+    .filter(Boolean);
+}
 
 function recordValidation(jobId, type, result, score, notes, workerId = null) {
   getDb()
@@ -53,10 +66,28 @@ export async function validateResult(job, result, ctx = {}) {
     if (!r.pass) reasons.push(`automated: ${r.notes}`);
   }
 
-  // L4 — review rubric thresholds (review jobs).
-  if (job.type === 'code.review' && result.review) {
+  // L4 — review jobs. The verdict is attacker-controlled (worker POSTs result.review), so it is
+  // NOT trusted as-is: the rubric must be well-formed (REVIEW_RUBRIC_SCHEMA — previously defined
+  // but never applied), and the reviewer must be INDEPENDENT of the implementer (identity taken
+  // from the claim record job.assigned_worker_id, never the self-reported result.review_worker_id).
+  if (job.type === 'code.review') {
+    const reviewer = job.assigned_worker_id;
+    const rubric = validateAgainst(REVIEW_RUBRIC_SCHEMA, result.review || {});
+    if (!rubric.valid) {
+      recordValidation(job.id, 'review', 'fail', result.review || null, `malformed rubric: ${rubric.errors.join('; ')}`, reviewer);
+      layers.push({ layer: 'review', pass: false });
+      reasons.push(`review rubric: ${rubric.errors.join('; ')}`);
+      return { pass: false, layers, reasons };
+    }
+    const authors = implAuthorsOf(job.id);
+    if (!reviewer || authors.includes(reviewer)) {
+      recordValidation(job.id, 'review', 'fail', result.review, 'reviewer not independent of implementer', reviewer);
+      layers.push({ layer: 'review', pass: false });
+      reasons.push('review not independent: reviewer authored the implementation it reviews');
+      return { pass: false, layers, reasons };
+    }
     const v = evaluateRubric(result.review, ctx.contract || {});
-    recordValidation(job.id, 'review', v.pass ? 'pass' : 'fail', result.review, v.notes, result.review_worker_id);
+    recordValidation(job.id, 'review', v.pass ? 'pass' : 'fail', result.review, v.notes, reviewer);
     layers.push({ layer: 'review', pass: v.pass });
     if (!v.pass) reasons.push(`review: ${v.notes}`);
   }

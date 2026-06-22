@@ -41,20 +41,24 @@ async function readBody(req) {
 
 // ---- Route handlers ----------------------------------------------------------
 
+const MAX_SLOTS_PER_WORKER = 8; // server cap — a worker cannot self-declare unbounded concurrency
+
 async function registerWorker(body) {
   const d = getDb();
   const id = body.worker_id || mkWorkerId(body.owner_id || 'worker');
   const existing = d.prepare('SELECT id FROM workers WHERE id = ?').get(id);
   const manifest = body.manifest || { capabilities: body.capabilities, interfaces: body.interfaces };
+  const maxSlots = Math.max(1, Math.min(Number(body.max_slots) || 1, MAX_SLOTS_PER_WORKER));
   if (existing) {
+    // trust_tier is NEVER set from the client — trust is EARNED via reputation, not declared.
     d.prepare(
-      `UPDATE workers SET status='online', last_heartbeat=?, trust_tier=?, manifest_json=?, max_slots=? WHERE id=?`
-    ).run(now(), body.trust_tier ?? 0, JSON.stringify(manifest), body.max_slots ?? 1, id);
+      `UPDATE workers SET status='online', last_heartbeat=?, manifest_json=?, max_slots=? WHERE id=?`
+    ).run(now(), JSON.stringify(manifest), maxSlots, id);
   } else {
     d.prepare(
       `INSERT INTO workers(id, owner_id, status, last_heartbeat, trust_tier, manifest_json, active_slots, max_slots, created_at)
        VALUES(?,?,?,?,?,?,?,?,?)`
-    ).run(id, body.owner_id || null, 'online', now(), body.trust_tier ?? 0, JSON.stringify(manifest), 0, body.max_slots ?? 1, now());
+    ).run(id, body.owner_id || null, 'online', now(), 0, JSON.stringify(manifest), 0, maxSlots, now());
   }
   logEvent('worker', id, 'registered', { capabilities: manifest.capabilities });
   return { worker_id: id };
@@ -67,14 +71,22 @@ function heartbeat(body) {
 
 function claim(body) {
   const d = getDb();
-  d.prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', body.worker_id);
+  const workerId = body.worker_id;
+  // Verify-don't-trust: a worker must be registered, and EVERY scheduling gate value is read from
+  // server state — capabilities/max_slots from the registered manifest row, active_slots from a
+  // live count, trust from earned reputation — never from the claim body.
+  const row = d.prepare('SELECT * FROM workers WHERE id=?').get(workerId);
+  if (!row) return { job: null, reason: 'worker not registered' };
+  d.prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', workerId);
+  const manifest = (() => { try { return JSON.parse(row.manifest_json || '{}'); } catch { return {}; } })();
+  const activeSlots = d.prepare("SELECT COUNT(*) AS c FROM assignments WHERE worker_id=? AND status='running'").get(workerId).c;
   const worker = {
-    id: body.worker_id,
-    capabilities: body.capabilities || [],
-    trust_tier: body.trust_tier ?? 0,
-    adapter_hint: body.adapter_hint,
-    max_slots: body.max_slots ?? 1,
-    active_slots: body.active_slots ?? 0,
+    id: workerId,
+    capabilities: manifest.capabilities || [],
+    trust_tier: row.trust_tier ?? 0,
+    adapter_hint: manifest.adapter_hint || null,
+    max_slots: row.max_slots ?? 1,
+    active_slots: activeSlots,
   };
   if (worker.active_slots >= worker.max_slots) return { job: null, reason: 'worker at capacity' };
 
