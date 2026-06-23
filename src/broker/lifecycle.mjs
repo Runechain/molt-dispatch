@@ -56,18 +56,30 @@ function acceptJob(job, result = {}) {
     recordEvent(job.assigned_worker_id, job.capability_required, 'resumed_successfully', job.id, meta);
   }
 
+  // Verify-don't-trust (security audit, item #2): the needs_review hold must key off EARNED
+  // trust, NOT the worker-controlled `result.provider`. Route ANY low-trust result through a
+  // secondary review regardless of provider, so a low-rep worker can't skip the hold by
+  // declaring a non-bedrock provider. Trust is read after the accept event (matching the prior
+  // bedrock-review semantics): a worker with accumulated bad history stays sub-threshold and is
+  // held; a clean worker isn't penalized merely for being new. The bedrock fuel-charge path is
+  // preserved below.
+  const rep = trustScore(job.assigned_worker_id, job.capability_required);
+  const lowTrust = rep < FUEL.repThreshold;
+
   // Settle fuel: charge the actual cost (or estimate) for paid (Bedrock) jobs.
-  // Low-rep workers get their fuel held pending a secondary review before it settles.
+  // Low-rep workers get their fuel held pending the secondary review before it settles.
   if (result.provider === 'bedrock') {
     const inputTokens = result.tokens_in ?? Math.ceil((job.prompt || '').length / 4);
     const outputTokens = result.tokens_out ?? 500;
     const actualCents = estimateCost(result.provider, result.model || 'claude-3-haiku', inputTokens, outputTokens);
-    const rep = trustScore(job.assigned_worker_id, job.capability_required);
-    if (rep < FUEL.repThreshold) {
+    if (lowTrust) {
       markNeedsReview(job.objective_id, job.id, actualCents);
     } else {
       chargeFuel(PRIMARY_ACCOUNT, job.id, actualCents, `${result.provider}/${result.model || '?'}`);
     }
+  } else if (lowTrust) {
+    // Non-bedrock (no fuel to settle) but still low-trust: hold for secondary review.
+    markNeedsReview(job.objective_id, job.id, 0);
   }
 
   logEvent('job', job.id, 'accepted', { worker: job.assigned_worker_id, model: result.model, provider: result.provider });
