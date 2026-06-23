@@ -51,19 +51,38 @@ export async function validateResult(job, result, ctx = {}) {
   }
 
   // L2 + L3 — static + automated (only meaningful for implementation jobs with a patch).
-  // ctx.staticCheck / ctx.automatedCheck are injected by the broker in M3 once the
-  // worktree exists. Absent (e.g. mock adapter), these layers are skipped, not failed.
+  // ctx.staticCheck / ctx.automatedCheck are injected by the broker (buildResultCtx) once the
+  // worktree exists. They run untrusted, worker-authored code, so the broker — not the worker —
+  // must be the one to clear them.
+  let ranGroundTruth = false;
   if (ctx.staticCheck) {
     const r = await ctx.staticCheck(job, result);
     recordValidation(job.id, 'static', r.pass ? 'pass' : 'fail', r.score, r.notes);
     layers.push({ layer: 'static', pass: r.pass });
+    ranGroundTruth = true;
     if (!r.pass) reasons.push(`static: ${r.notes}`);
   }
   if (ctx.automatedCheck) {
     const r = await ctx.automatedCheck(job, result);
     recordValidation(job.id, 'automated', r.pass ? 'pass' : 'fail', r.score, r.notes);
     layers.push({ layer: 'automated', pass: r.pass });
+    ranGroundTruth = true;
     if (!r.pass) reasons.push(`automated: ${r.notes}`);
+  }
+
+  // FAIL-CLOSED for untrusted code. A code.implementation result is the output of an untrusted
+  // worker editing a worktree; accepting it requires the broker to have actually verified it
+  // against ground truth (L2 and/or L3). If NEITHER check could run — buildResultCtx didn't
+  // attach them, meaning no worktree/repo was bound — we must NOT silently accept on schema
+  // alone. Reject so unverified code can't slip through.
+  //
+  // Scoping: this fires ONLY for type === 'code.implementation'. Inference/mock/non-code jobs
+  // (e.g. verify_grid's inference flow) carry no static/automated ctx by design and are
+  // unaffected — there is no untrusted patch to verify for them.
+  if (job.type === 'code.implementation' && !ranGroundTruth) {
+    recordValidation(job.id, 'static', 'fail', null, 'no ground-truth verification available (fail-closed)');
+    layers.push({ layer: 'static', pass: false });
+    reasons.push('fail-closed: code.implementation accepted without static/automated verification');
   }
 
   // L4 — review jobs. The verdict is attacker-controlled (worker POSTs result.review), so it is
