@@ -28,9 +28,29 @@ const json = (res, code, body) => {
   res.end(JSON.stringify(body));
 };
 
+// Ingress caps: an unbounded request body is an OOM lever for an anonymous caller. Cap the
+// cumulative bytes and bound the read with a socket timeout so a slow-loris stall can't pin a
+// connection forever. A 413 is surfaced via a sentinel the router translates to a response.
+const MAX_BODY_BYTES = 1_000_000;
+const BODY_TIMEOUT_MS = 30_000;
+const BODY_TOO_LARGE = Symbol('body_too_large');
+
 async function readBody(req) {
+  req.setTimeout(BODY_TIMEOUT_MS);
   const chunks = [];
-  for await (const c of req) chunks.push(c);
+  let size = 0;
+  for await (const c of req) {
+    size += c.length;
+    if (size > MAX_BODY_BYTES) {
+      // Stop accumulating but keep draining the socket so the 413 response flushes cleanly
+      // instead of the client seeing a connection reset. pause()+resume() discards the rest.
+      req.pause();
+      req.on('data', () => {}); // drain any further chunks to the floor
+      req.resume();
+      return BODY_TOO_LARGE;
+    }
+    chunks.push(c);
+  }
   if (chunks.length === 0) return {};
   try {
     return JSON.parse(Buffer.concat(chunks).toString('utf8'));
@@ -39,13 +59,74 @@ async function readBody(req) {
   }
 }
 
+// ---- Rate limiting -----------------------------------------------------------
+// Dependency-free, in-memory token-ish window keyed by source IP AND worker_id. Anonymous/open
+// ingress (workers and jobs) is the abuse surface: a single source or a single forged worker_id
+// could flood register/claim/heartbeat. Buckets prune so the map can't grow unbounded.
+const RATE = {
+  windowMs: Number(process.env.MOLT_RATE_WINDOW_MS || 10_000),
+  max: Number(process.env.MOLT_RATE_MAX || 60), // requests per key per window
+  maxConcurrentClaims: Number(process.env.MOLT_MAX_CONCURRENT_CLAIMS || 32),
+};
+const rateBuckets = new Map(); // key -> { count, resetAt }
+let inflightClaims = 0;
+
+function pruneRateBuckets(t) {
+  for (const [k, b] of rateBuckets) if (b.resetAt <= t) rateBuckets.delete(k);
+}
+
+// Returns true if the key is OVER its window budget (i.e. the request should be rejected).
+function rateLimited(key) {
+  const t = Date.now();
+  if (rateBuckets.size > 4096) pruneRateBuckets(t); // opportunistic prune
+  let b = rateBuckets.get(key);
+  if (!b || b.resetAt <= t) {
+    b = { count: 0, resetAt: t + RATE.windowMs };
+    rateBuckets.set(key, b);
+  }
+  b.count += 1;
+  return b.count > RATE.max;
+}
+
+function clientIp(req) {
+  const xff = req.headers['x-forwarded-for'];
+  if (xff) return String(xff).split(',')[0].trim();
+  return req.socket?.remoteAddress || 'unknown';
+}
+
+// Rate-limit the open ingress surface (POST /workers/* and /jobs/*) by the asserted worker_id, so a
+// forged id flooding from rotating IPs is still throttled. The IP dimension is checked separately
+// (pre-body) in the router. Returns a 429 sentinel object (or null when allowed).
+function checkIngressRate(req, path, body) {
+  if (!/^\/(workers|jobs)\b/.test(path)) return null;
+  const wid = (body && typeof body.worker_id === 'string') ? body.worker_id.slice(0, 64) : '-';
+  if (rateLimited(`wid:${wid}`)) {
+    return { error: 'rate limit exceeded', code: 429 };
+  }
+  return null;
+}
+
 // ---- Route handlers ----------------------------------------------------------
 
 const MAX_SLOTS_PER_WORKER = 8; // server cap — a worker cannot self-declare unbounded concurrency
 
+// A client-supplied worker_id must be a constrained slug — never trusted verbatim. A raw id can
+// otherwise carry path/SQL-adjacent metacharacters, control bytes, or megabyte payloads that leak
+// into branch names (`grid/<id>`), worktree paths, and event logs. Slugify to the safe charset and
+// length; if nothing survives, mint a fresh server-side id.
+const WORKER_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
+function constrainWorkerId(raw, ownerId) {
+  if (typeof raw === 'string' && WORKER_ID_RE.test(raw)) return raw;
+  if (typeof raw === 'string') {
+    const slug = raw.replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 64).replace(/^-+|-+$/g, '');
+    if (slug) return slug;
+  }
+  return mkWorkerId(ownerId || 'worker');
+}
+
 async function registerWorker(body) {
   const d = getDb();
-  const id = body.worker_id || mkWorkerId(body.owner_id || 'worker');
+  const id = body.worker_id ? constrainWorkerId(body.worker_id, body.owner_id) : mkWorkerId(body.owner_id || 'worker');
   const existing = d.prepare('SELECT id FROM workers WHERE id = ?').get(id);
   const manifest = body.manifest || { capabilities: body.capabilities, interfaces: body.interfaces };
   const maxSlots = Math.max(1, Math.min(Number(body.max_slots) || 1, MAX_SLOTS_PER_WORKER));
@@ -404,6 +485,25 @@ function listEvents(limit = 100) {
   return getDb().prepare('SELECT * FROM events ORDER BY created_at DESC LIMIT ?').all(limit);
 }
 
+// ---- Redaction: anonymous GET projections ------------------------------------
+// When MOLT_AUTH=1 and the caller is NOT authed, read endpoints must not leak the things a public
+// dashboard scrape would otherwise expose: objective prompts, absolute repo paths, raw
+// contract/spec/payload JSON, created_by/source_issue provenance, the event stream, and the fuel
+// ledger detail. The authed view is unchanged — these only run on the anonymous path.
+function redactObjective(o) {
+  const { prompt, repo, contract_json, created_by, source_issue, ...rest } = o;
+  return { ...rest, repo: repo ? '<redacted>' : null };
+}
+function redactJob(j) {
+  const { prompt, spec_json, contract_json, payload_json, last_failed_worker_id, ...rest } = j;
+  return rest;
+}
+function redactFuelEntry(e) {
+  // Keep coarse shape (kind/amount/time) but drop the free-text note, wallet, and any payload.
+  const { note, payload_json, wallet_address, account_id, ...rest } = e;
+  return rest;
+}
+
 // ---- Lease sweep: requeue jobs whose worker died (lease expired) --------------
 
 export function sweepLeases() {
@@ -443,7 +543,12 @@ async function serveStatic(req, res, urlPath) {
     const s = await stat(filePath);
     if (!s.isFile()) throw new Error('not file');
     const data = await readFile(filePath);
-    res.writeHead(200, { 'content-type': MIME[extname(filePath)] || 'application/octet-stream' });
+    res.writeHead(200, {
+      'content-type': MIME[extname(filePath)] || 'application/octet-stream',
+      // Lock the dashboard to same-origin assets: no inline/remote script injection vector.
+      'content-security-policy': "default-src 'self'",
+      'x-content-type-options': 'nosniff',
+    });
     res.end(data);
   } catch {
     json(res, 404, { error: 'not found' });
@@ -551,31 +656,61 @@ export function startBroker() {
     const path = prefix && rawPath.startsWith(prefix) ? rawPath.slice(prefix.length) || '/' : rawPath;
     const method = req.method;
     try {
-      // Permissionless contribution: ANY agent can register and do work with NO key — the trust
-      // layer is reputation + redundant verification + consensus, not API keys (the DACG model).
-      // MOLT_AUTH=1 gates ONLY operator/spend endpoints (commission work, approve merges, credit/
-      // settle fuel) — never worker connection. MOLT_AUTH unset/0 = fully open. Checked live.
-      if (process.env.MOLT_AUTH === '1' && requiresOperatorAuth(method, path) && !authOk(req)) {
+      // MOLT_AUTH=1 gates mutating endpoints; with MOLT_OPEN_GRID=1 worker/job ingress is opened but
+      // operator/spend endpoints (commission work, approve merges, credit/settle fuel) stay gated.
+      // MOLT_AUTH unset/0 = fully open. Checked live.
+      const authed = process.env.MOLT_AUTH === '1' ? authOk(req) : true;
+      if (process.env.MOLT_AUTH === '1' && requiresOperatorAuth(method, path) && !authed) {
         return json(res, 401, { error: 'unauthorized: operator endpoint — send Authorization: Bearer <api-key>' });
       }
 
+      // Parse the body once for POST routes so we can rate-limit by worker_id and reject oversized
+      // bodies uniformly before any handler runs.
+      let body = null;
+      if (method === 'POST') {
+        // IP-keyed rate gate first (cheap, no body needed) so a flood is shed before we read it.
+        const ip = clientIp(req);
+        if (/^\/(workers|jobs)\b/.test(path) && rateLimited(`ip:${ip}`)) {
+          return json(res, 429, { error: 'rate limit exceeded' });
+        }
+        body = await readBody(req);
+        if (body === BODY_TOO_LARGE) {
+          // Close the connection: the client's upload was truncated, so the socket can't be safely
+          // reused for keep-alive.
+          res.writeHead(413, { 'content-type': 'application/json', connection: 'close' });
+          return res.end(JSON.stringify({ error: 'request body too large' }));
+        }
+        // worker_id-keyed gate (a forged id flooding from rotating IPs).
+        const rl = checkIngressRate(req, path, body);
+        if (rl) return json(res, rl.code, { error: rl.error });
+      }
+
       // API
-      if (method === 'POST' && path === '/workers/register') return json(res, 200, await registerWorker(await readBody(req)));
-      if (method === 'POST' && path === '/workers/heartbeat') return json(res, 200, heartbeat(await readBody(req)));
-      if (method === 'POST' && path === '/jobs/claim') return json(res, 200, claim(await readBody(req)));
+      if (method === 'POST' && path === '/workers/register') return json(res, 200, await registerWorker(body));
+      if (method === 'POST' && path === '/workers/heartbeat') return json(res, 200, heartbeat(body));
+      if (method === 'POST' && path === '/jobs/claim') {
+        // Global concurrent-claim ceiling: a hard cap on simultaneous claim handling so a burst
+        // can't exhaust DB/CPU even if it slips the per-key window.
+        if (inflightClaims >= RATE.maxConcurrentClaims) {
+          return json(res, 429, { error: 'broker at claim capacity, retry shortly' });
+        }
+        inflightClaims += 1;
+        try { return json(res, 200, claim(body)); }
+        finally { inflightClaims -= 1; }
+      }
       const checkpointMatch = path.match(/^\/jobs\/([^/]+)\/checkpoint$/);
       if (method === 'POST' && checkpointMatch) {
-        const r = saveCheckpoint(checkpointMatch[1], await readBody(req));
+        const r = saveCheckpoint(checkpointMatch[1], body);
         return json(res, r.code || 200, r);
       }
       const resultMatch = path.match(/^\/jobs\/([^/]+)\/result$/);
       if (method === 'POST' && resultMatch) {
-        const r = await submitResult(resultMatch[1], await readBody(req));
+        const r = await submitResult(resultMatch[1], body);
         return json(res, r.code || 200, r);
       }
-      if (method === 'POST' && path === '/objectives') return json(res, 200, await createObjective(await readBody(req)));
+      if (method === 'POST' && path === '/objectives') return json(res, 200, await createObjective(body));
       if (method === 'POST' && path === '/github/import-issues') {
-        const r = await importIssues(await readBody(req));
+        const r = await importIssues(body);
         return json(res, r.code || 200, r);
       }
       const approveMatch = path.match(/^\/objectives\/([^/]+)\/approve$/);
@@ -585,19 +720,36 @@ export function startBroker() {
       const releaseMatch = path.match(/^\/objectives\/([^/]+)\/release$/);
       if (method === 'POST' && releaseMatch) { const r = releaseObjective(releaseMatch[1]); return json(res, r.code || 200, r); }
 
-      // Fuel ledger
+      // Fuel ledger. Anonymous callers (MOLT_AUTH=1 + unauthed) get a redacted ledger projection.
       if (method === 'GET' && path === '/fuel/balance') return json(res, 200, getFuelBalance(url.searchParams.get('account') || PRIMARY_ACCOUNT));
-      if (method === 'GET' && path === '/fuel/log') return json(res, 200, getFuelLog(url.searchParams.get('account') || PRIMARY_ACCOUNT, Number(url.searchParams.get('limit') || 50)));
-      if (method === 'POST' && path === '/fuel/credit') { const r = postFuelCredit(await readBody(req)); return json(res, r.code || 200, r); }
+      if (method === 'GET' && path === '/fuel/log') {
+        const log = getFuelLog(url.searchParams.get('account') || PRIMARY_ACCOUNT, Number(url.searchParams.get('limit') || 50));
+        return json(res, 200, authed ? log : log.map(redactFuelEntry));
+      }
+      if (method === 'POST' && path === '/fuel/credit') { const r = postFuelCredit(body); return json(res, r.code || 200, r); }
 
       // Payments (x402 value rail)
-      if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(await readBody(req)); return json(res, r.code || 200, r); }
-      if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(await readBody(req)); return json(res, r.code || 200, r); }
+      if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(body); return json(res, r.code || 200, r); }
+      if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(body); return json(res, r.code || 200, r); }
 
-      if (method === 'GET' && path === '/objectives') return json(res, 200, listObjectives());
-      if (method === 'GET' && path === '/jobs') return json(res, 200, listJobs(url.searchParams.get('objective')));
+      // Read endpoints. When auth is enforced and the caller is unauthed, return a REDACTED
+      // projection (no prompts, absolute repo paths, raw contract/spec/payload JSON, provenance,
+      // event stream). The authed view is unchanged. /health and the dashboard stay open.
+      if (method === 'GET' && path === '/objectives') {
+        const objs = listObjectives();
+        return json(res, 200, authed ? objs : objs.map(redactObjective));
+      }
+      if (method === 'GET' && path === '/jobs') {
+        const jobs = listJobs(url.searchParams.get('objective'));
+        return json(res, 200, authed ? jobs : jobs.map(redactJob));
+      }
       if (method === 'GET' && path === '/workers') return json(res, 200, listWorkers());
-      if (method === 'GET' && path === '/events') return json(res, 200, listEvents(Number(url.searchParams.get('limit') || 100)));
+      if (method === 'GET' && path === '/events') {
+        // The event stream leaks objective titles, issue numbers, and worker activity — gate it
+        // entirely for anonymous callers rather than trying to redact each payload.
+        if (!authed) return json(res, 200, []);
+        return json(res, 200, listEvents(Number(url.searchParams.get('limit') || 100)));
+      }
       if (method === 'GET' && path === '/health') return json(res, 200, { ok: true, time: now() });
 
       // Dashboard
