@@ -33,6 +33,26 @@ function minimalExecEnv() {
   };
 }
 
+// L3 acceptance commands run UNTRUSTED, worker-authored code. In open-grid mode (untrusted
+// workers) that is a live ACE surface, so we REFUSE to run it unless the operator has configured a
+// real sandbox (MOLT_L3_SANDBOX = a wrapper command, e.g. bwrap/nsjail/firejail confining to the
+// worktree with no DATA_ROOT access). Gated/team mode (trusted workers) runs with minimal-env +
+// resource limits. Returns a refusal reason string, or null to proceed.
+export function l3Refusal() {
+  if (process.env.MOLT_OPEN_GRID === '1' && !process.env.MOLT_L3_SANDBOX) {
+    return 'L3 acceptance commands run untrusted worker code; refusing in open-grid mode without MOLT_L3_SANDBOX (set it to a sandbox wrapper)';
+  }
+  return null;
+}
+
+// Wrap an acceptance command with resource limits (CPU seconds, max file size, no core dumps —
+// on top of the 5-min wall timeout) and, when configured, the operator's sandbox wrapper.
+export function l3Command(cmd) {
+  const limited = `ulimit -t 120 -f 524288 -c 0 2>/dev/null; ${cmd}`;
+  const sandbox = process.env.MOLT_L3_SANDBOX;
+  return sandbox ? `${sandbox} sh -c ${JSON.stringify(limited)}` : limited;
+}
+
 // Broker ground truth: the files a branch actually changed vs its base, computed by the
 // broker over its own repo (never trusting the worker's self-reported changed_files).
 // Returns null when it can't be computed (no repo/branch on disk) so callers can fall back.
@@ -108,10 +128,12 @@ async function automatedCheck(worktree, contract) {
   const cmds = contract.validation?.automated || [];
   if (cmds.length === 0) return { pass: true, ran: false, notes: 'no automated checks configured' };
   if (!existsSync(worktree)) return { pass: false, ran: false, notes: `worktree missing: ${worktree}` };
+  const refusal = l3Refusal();
+  if (refusal) return { pass: false, ran: false, notes: refusal };
 
   const results = [];
   for (const cmd of cmds) {
-    const r = await run('sh', ['-c', cmd], {
+    const r = await run('sh', ['-c', l3Command(cmd)], {
       cwd: worktree,
       timeoutMs: 5 * 60 * 1000,
       replaceEnv: true,

@@ -15,6 +15,7 @@ const { claimableJobsFor } = await import('../src/broker/scheduler.mjs');
 const { validateResult } = await import('../src/broker/validator.mjs');
 const { recordEvent } = await import('../src/broker/reputation.mjs');
 const { onResult } = await import('../src/broker/lifecycle.mjs');
+const { l3Refusal, l3Command } = await import('../src/broker/broker-ops.mjs');
 
 let passed = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); passed++; console.log(`  ✓ ${msg}`); };
@@ -119,6 +120,19 @@ console.log('re-audit #2 — fail-closed tracks AUTHORITATIVE truth, not "a chec
   // staticCheck with real ground truth (truth:true) → authoritative → accepted.
   v = await validateResult(implRow, envelope, { staticCheck: async () => ({ pass: true, truth: true, notes: 'ground-truth' }) });
   ok(v.pass === true, 'code.implementation with AUTHORITATIVE ground-truth static passes');
+}
+
+console.log('#25 — L3 acceptance commands refuse to run untrusted code unsandboxed in open-grid mode');
+{
+  delete process.env.MOLT_OPEN_GRID; delete process.env.MOLT_L3_SANDBOX;
+  ok(l3Refusal() === null, 'gated mode (trusted workers): L3 runs');
+  process.env.MOLT_OPEN_GRID = '1';
+  ok(typeof l3Refusal() === 'string', 'open-grid + no sandbox: L3 is REFUSED (fail-closed against ACE)');
+  process.env.MOLT_L3_SANDBOX = 'bwrap --unshare-all';
+  ok(l3Refusal() === null, 'open-grid + a configured sandbox: L3 runs');
+  ok(l3Command('npm test').includes('bwrap --unshare-all'), 'the configured sandbox wraps the command');
+  delete process.env.MOLT_OPEN_GRID; delete process.env.MOLT_L3_SANDBOX;
+  ok(/ulimit -t \d+/.test(l3Command('npm test')), 'acceptance commands carry CPU/file resource limits');
 }
 
 console.log(`\n✅ security hardening: ${passed} checks passed`);
