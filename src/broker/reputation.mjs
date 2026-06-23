@@ -31,24 +31,31 @@ export function recordEvent(workerId, capability, eventType, evidenceJobId = nul
     .run(workerId, capability, eventType, delta, evidenceJobId, meta.model || null, meta.provider || null, now());
 }
 
-// Trust in [0,1] for a (worker, capability). New workers sit at a neutral 0.5 prior
-// so the scheduler will try them, then converges toward observed accepted-rate.
+// Sybil-resistant UNPROVEN prior (security audit): a fresh id with zero history must sit
+// BELOW the fuel/secondary-review gate (FUEL.repThreshold=0.4) so it can't clear the
+// low-rep verify gate or out-rank an established worker just by registering. Workers with
+// real history are scored by their Laplace-smoothed accepted-rate, which can rise above it.
+export const UNPROVEN_PRIOR = 0.3;
+
+// Trust in [0,1] for a (worker, capability). New (unproven) workers sit below the fuel
+// threshold; the scheduler will still try them (it gates on job.trust_required, which is 0
+// by default), then trust converges toward the observed accepted-rate as history accrues.
 export function trustScore(workerId, capability) {
-  if (!workerId || !capability) return 0.5;
+  if (!workerId || !capability) return UNPROVEN_PRIOR;
   const rows = getDb()
     .prepare(
       `SELECT event_type, COUNT(*) AS n FROM reputation_events
        WHERE worker_id = ? AND capability = ? GROUP BY event_type`
     )
     .all(workerId, capability);
-  if (rows.length === 0) return 0.5;
+  if (rows.length === 0) return UNPROVEN_PRIOR;
 
   const counts = Object.fromEntries(rows.map((r) => [r.event_type, r.n]));
   const accepted = counts.accepted || 0;
   let bad = 0;
   for (const ev of BAD_EVENTS) bad += counts[ev] || 0;
   const total = accepted + bad;
-  if (total === 0) return 0.5;
+  if (total === 0) return UNPROVEN_PRIOR;
   // Laplace-smoothed accepted ratio.
   return (accepted + 1) / (total + 2);
 }
