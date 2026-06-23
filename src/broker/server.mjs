@@ -363,7 +363,7 @@ async function importIssues(body) {
     }
     const out = await createObjectiveRow({
       title: `#${issue.number} ${issue.title}`,
-      prompt: issue.body || issue.title,
+      prompt: (issue.body || issue.title || '').slice(0, 16000), // cap untrusted issue text at import
       repo: body.repo,
       branch_base: body.base || 'main',
       contract: defaultIssueContract(body.test),

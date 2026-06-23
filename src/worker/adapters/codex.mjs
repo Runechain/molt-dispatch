@@ -39,7 +39,9 @@ function ensureCodexHome() {
       'approval_policy = "never"',
       '',
       '[sandbox_workspace_write]',
-      'network_access = true',
+      // Network OFF by default — an injected prompt over attacker-controlled issue text could
+      // otherwise use egress to exfiltrate. Opt in per deployment with MOLT_CODEX_NETWORK=1.
+      `network_access = ${process.env.MOLT_CODEX_NETWORK === '1' ? 'true' : 'false'}`,
       '',
     ].join('\n')
   );

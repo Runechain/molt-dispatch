@@ -11,6 +11,7 @@
 
 import { extractJson } from '../../shared/jsonout.mjs';
 import { PLAN_SCHEMA, validateAgainst } from '../../shared/schema.mjs';
+import { fenceUntrusted, sanitizeTitle } from '../../shared/prompt-safety.mjs';
 import { logEvent } from '../db.mjs';
 
 const CAPS = ['code.implementation', 'tests.unit', 'code.review', 'docs.technical', 'product.specification'];
@@ -42,8 +43,8 @@ function logicScaffold(objective) {
 function plannerAgentPrompt(objective, scaffold) {
   return [
     'You are the PLANNER AGENT. Logic has already produced the deterministic scaffold below. Your job is to DECOMPOSE the objective into the full job DAG — bounded, independently checkable, FILE-SCOPED work units.',
-    `\nObjective: "${objective.title}"`,
-    objective.prompt ? `Detail:\n${objective.prompt}` : '',
+    `\nObjective: "${sanitizeTitle(objective.title)}"`,
+    objective.prompt ? `Detail:\n${fenceUntrusted(objective.prompt)}` : '',
     `\nLogic-first scaffold (honor these):\n${JSON.stringify(scaffold, null, 2)}`,
     '\nRules:',
     `  - Use ONLY these capabilities: ${CAPS.join(', ')}.`,
