@@ -36,11 +36,25 @@ function otherCapableWorkerOnline(job, excludeWorkerId) {
   });
 }
 
+// The set of workers that authored an implementation a given review job depends on — used to
+// keep a reviewer independent of the implementer (verify-don't-trust: a self-graded review is no
+// review). Derived from the claim/assignment record, never from worker-self-reported fields.
+function reviewImplAuthors(reviewJobId) {
+  return getDb()
+    .prepare(
+      `SELECT DISTINCT j.assigned_worker_id AS w FROM job_dependencies jd
+         JOIN jobs j ON j.id = jd.depends_on_job_id
+        WHERE jd.job_id = ? AND j.type = 'code.implementation'`
+    )
+    .all(reviewJobId)
+    .map((r) => r.w)
+    .filter(Boolean);
+}
+
 // A job is claimable when it's pending and every dependency has been ACCEPTED.
 export function claimableJobsFor(worker) {
   const d = getDb();
   const caps = new Set(worker.capabilities || []);
-  const trust = worker.trust_tier ?? 0;
 
   const pending = d
     .prepare(`SELECT * FROM jobs WHERE status = 'pending' ORDER BY priority ASC, created_at ASC`)
@@ -59,8 +73,10 @@ export function claimableJobsFor(worker) {
     if (objBlocked.has(job.objective_id) || objHeld.has(job.objective_id)) continue;
     // HARD: capability
     if (job.capability_required && !caps.has(job.capability_required)) continue;
-    // HARD: trust tier
-    if ((job.trust_required ?? 0) > trust) continue;
+    // HARD: trust — gated on EARNED reputation for the job's capability, never a self-declared tier.
+    if ((job.trust_required ?? 0) > trustScore(worker.id, job.capability_required)) continue;
+    // HARD: reviewer independence — a worker may not review an implementation it authored.
+    if (job.type === 'code.review' && reviewImplAuthors(job.id).includes(worker.id)) continue;
     // SOFT-as-HARD: don't re-hand a dropped job to the worker that dropped it IF someone
     // else can take it (continuation handoff). If it's the only option, let it through.
     if (job.last_failed_worker_id && job.last_failed_worker_id === worker.id && otherCapableWorkerOnline(job, worker.id)) {

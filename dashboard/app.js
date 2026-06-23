@@ -9,15 +9,18 @@ async function getJSON(path) {
 }
 
 function badge(status) {
-  return `<span class="badge b-${status}">${status.replace(/_/g, ' ')}</span>`;
+  const s = String(status ?? '');
+  return `<span class="badge b-${escapeHtml(s)}">${escapeHtml(s.replace(/_/g, ' '))}</span>`;
 }
 
 function jobRow(j) {
-  const dep = j.depends_on?.length ? `<span class="dep">⇠ ${j.depends_on.join(', ')}</span>` : '';
-  const adapter = j.adapter_hint ? `<span class="adapter">${j.adapter_hint}</span>` : '';
+  const dep = j.depends_on?.length
+    ? `<span class="dep">⇠ ${escapeHtml(j.depends_on.join(', '))}</span>`
+    : '';
+  const adapter = j.adapter_hint ? `<span class="adapter">${escapeHtml(j.adapter_hint)}</span>` : '';
   return `<div class="job">
-    <span class="jid">${j.id}</span>
-    <span class="jkey">${j.job_key || j.type}</span>
+    <span class="jid">${escapeHtml(j.id)}</span>
+    <span class="jkey">${escapeHtml(j.job_key || j.type)}</span>
     ${adapter}${dep}
     ${badge(j.status)}
   </div>`;
@@ -72,15 +75,15 @@ async function renderWorkers() {
       const rep = (w.reputation || [])
         .map(
           (r) => `<div class="rep-row">
-            <span class="cap">${r.capability}</span>
-            <span class="bar"><span style="width:${Math.round(r.trust_score * 100)}%"></span></span>
-            <span>${r.trust_score}</span>
+            <span class="cap">${escapeHtml(r.capability)}</span>
+            <span class="bar"><span style="width:${Math.round(Number(r.trust_score) * 100)}%"></span></span>
+            <span>${escapeHtml(r.trust_score)}</span>
           </div>`
         )
         .join('');
       return `<div class="card worker">
-        <div class="wid">${w.id} ${badge(w.status)}</div>
-        <div class="meta">slots ${w.active_slots}/${w.max_slots} · trust tier ${w.trust_tier}</div>
+        <div class="wid">${escapeHtml(w.id)} ${badge(w.status)}</div>
+        <div class="meta">slots ${escapeHtml(w.active_slots)}/${escapeHtml(w.max_slots)} · trust tier ${escapeHtml(w.trust_tier)}</div>
         ${rep ? `<div class="rep">${rep}</div>` : ''}
       </div>`;
     })
@@ -93,7 +96,7 @@ async function renderEvents() {
   el.innerHTML = events
     .map((e) => {
       const t = new Date(e.created_at).toLocaleTimeString();
-      return `<div class="ev"><span class="et">${t}</span><span class="ee">${e.event_type}</span><span class="ed">${e.entity_id}</span></div>`;
+      return `<div class="ev"><span class="et">${escapeHtml(t)}</span><span class="ee">${escapeHtml(e.event_type)}</span><span class="ed">${escapeHtml(e.entity_id)}</span></div>`;
     })
     .join('');
 }

@@ -50,6 +50,14 @@ export async function onResult(jobId, result, ctx = {}) {
 
 function acceptJob(job, result = {}) {
   const meta = { model: result.model, provider: result.provider };
+  // Verify-don't-trust: snapshot EARNED trust BEFORE recording this acceptance. A zero-history
+  // worker must evaluate at the unproven prior (0.3 < repThreshold 0.4) so its FIRST result is
+  // held for secondary review — reading trust AFTER the accept we record below would lift it to
+  // ~0.667 and let every fresh identity skip the hold. The hold keys off earned trust, never the
+  // worker-controlled result.provider, so a low-rep worker can't bypass it by faking a provider.
+  const rep = trustScore(job.assigned_worker_id, job.capability_required);
+  const lowTrust = rep < FUEL.repThreshold;
+
   setJobStatus(job.id, 'accepted');
   recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id, meta);
   if ((job.checkpoint_seq || 0) > 0 || (job.attempts || 0) > 0) {
@@ -57,17 +65,19 @@ function acceptJob(job, result = {}) {
   }
 
   // Settle fuel: charge the actual cost (or estimate) for paid (Bedrock) jobs.
-  // Low-rep workers get their fuel held pending a secondary review before it settles.
+  // Low-rep workers get their fuel held pending the secondary review before it settles.
   if (result.provider === 'bedrock') {
     const inputTokens = result.tokens_in ?? Math.ceil((job.prompt || '').length / 4);
     const outputTokens = result.tokens_out ?? 500;
     const actualCents = estimateCost(result.provider, result.model || 'claude-3-haiku', inputTokens, outputTokens);
-    const rep = trustScore(job.assigned_worker_id, job.capability_required);
-    if (rep < FUEL.repThreshold) {
+    if (lowTrust) {
       markNeedsReview(job.objective_id, job.id, actualCents);
     } else {
       chargeFuel(PRIMARY_ACCOUNT, job.id, actualCents, `${result.provider}/${result.model || '?'}`);
     }
+  } else if (lowTrust) {
+    // Non-bedrock (no fuel to settle) but still low-trust: hold for secondary review.
+    markNeedsReview(job.objective_id, job.id, 0);
   }
 
   logEvent('job', job.id, 'accepted', { worker: job.assigned_worker_id, model: result.model, provider: result.provider });

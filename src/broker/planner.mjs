@@ -10,6 +10,7 @@ import { jobId } from '../shared/ids.mjs';
 import { run } from '../shared/proc.mjs';
 import { extractJson } from '../shared/jsonout.mjs';
 import { PLAN_SCHEMA, validateAgainst } from '../shared/schema.mjs';
+import { fenceUntrusted, sanitizeTitle } from '../shared/prompt-safety.mjs';
 import { decomposeWithAgent } from './agents/planner-agent.mjs';
 
 // Capabilities the grid can currently schedule, and which adapter serves each.
@@ -108,8 +109,8 @@ function implPrompt(obj, contract) {
   const gates = (contract.hard_completion_gates || []).map((g) => `  - ${g}`).join('\n');
   const forbidden = (contract.forbidden_without_approval || []).map((f) => `  - ${f}`).join('\n');
   return [
-    `You are implementing a bounded work unit for the objective: "${obj.title}".`,
-    obj.prompt ? `\nObjective detail:\n${obj.prompt}` : '',
+    `You are implementing a bounded work unit for the objective: "${sanitizeTitle(obj.title)}".`,
+    obj.prompt ? `\nObjective detail:\n${fenceUntrusted(obj.prompt)}` : '',
     gates ? `\nThis work is DONE only when ALL of these hold:\n${gates}` : '',
     forbidden ? `\nDo NOT do any of the following without approval:\n${forbidden}` : '',
     `\nWork only within this repository. Make the smallest correct change. Add or update tests.`,
@@ -189,8 +190,8 @@ function plannerPrompt(objective) {
   const caps = Object.entries(CAPABILITIES).map(([c, a]) => `  - ${c} (adapter: ${a})`).join('\n');
   return [
     `Decompose this objective into a SMALL dependency graph (2-5) of bounded work units.`,
-    `\nObjective: "${objective.title}"`,
-    objective.prompt ? `Detail: ${objective.prompt}` : '',
+    `\nObjective: "${sanitizeTitle(objective.title)}"`,
+    objective.prompt ? `Detail:\n${fenceUntrusted(objective.prompt)}` : '',
     `\nAvailable capabilities (use ONLY these):\n${caps}`,
     `\nRules:`,
     `  - Implementation work uses capability "code.implementation".`,
