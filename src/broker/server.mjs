@@ -257,11 +257,15 @@ function saveCheckpoint(jobId, body) {
   if (!body.lease_token || body.lease_token !== job.lease_token) {
     return { error: 'invalid or expired lease', code: 409 };
   }
+  // Cap checkpoint state so a worker can't bloat the resume payload that gets replayed to the next
+  // worker. (The partial is also fenced as untrusted data at replay time in the providers.)
+  const stateJson = JSON.stringify(body.state ?? {});
+  if (stateJson.length > 256_000) return { error: 'checkpoint state too large', code: 413 };
   const seq = (job.checkpoint_seq || 0) + 1;
   transaction(() => {
     d.prepare(
       `INSERT INTO checkpoints(id, job_id, worker_id, seq, state_json, note, created_at) VALUES(?,?,?,?,?,?,?)`
-    ).run(checkpointId(), jobId, job.assigned_worker_id, seq, JSON.stringify(body.state || {}), body.note || null, now());
+    ).run(checkpointId(), jobId, job.assigned_worker_id, seq, stateJson, body.note ? String(body.note).slice(0, 500) : null, now());
     d.prepare('UPDATE jobs SET checkpoint_seq=?, updated_at=? WHERE id=?').run(seq, now(), jobId);
   });
   return { ok: true, seq };
