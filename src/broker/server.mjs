@@ -35,28 +35,30 @@ const MAX_BODY_BYTES = 1_000_000;
 const BODY_TIMEOUT_MS = 30_000;
 const BODY_TOO_LARGE = Symbol('body_too_large');
 
-async function readBody(req) {
-  req.setTimeout(BODY_TIMEOUT_MS);
-  const chunks = [];
-  let size = 0;
-  for await (const c of req) {
-    size += c.length;
-    if (size > MAX_BODY_BYTES) {
-      // Stop accumulating but keep draining the socket so the 413 response flushes cleanly
-      // instead of the client seeing a connection reset. pause()+resume() discards the rest.
-      req.pause();
-      req.on('data', () => {}); // drain any further chunks to the floor
-      req.resume();
-      return BODY_TOO_LARGE;
-    }
-    chunks.push(c);
-  }
-  if (chunks.length === 0) return {};
-  try {
-    return JSON.parse(Buffer.concat(chunks).toString('utf8'));
-  } catch {
-    return {};
-  }
+function readBody(req) {
+  // Explicit event handling (not `for await`): once the cap is hit we resolve BODY_TOO_LARGE but
+  // KEEP a no-op data listener so the rest of the in-flight upload drains to the floor and the
+  // socket can close cleanly (connection:close). Mixing `for await` with a manual pause/drain
+  // races and can hang keep-alive clients, so we own the lifecycle here.
+  return new Promise((resolve) => {
+    req.setTimeout(BODY_TIMEOUT_MS);
+    const chunks = [];
+    let size = 0;
+    let done = false;
+    const finish = (val) => { if (!done) { done = true; resolve(val); } };
+    req.on('data', (c) => {
+      if (done) return; // already over cap / resolved — drain remaining chunks to the floor
+      size += c.length;
+      if (size > MAX_BODY_BYTES) return finish(BODY_TOO_LARGE);
+      chunks.push(c);
+    });
+    req.on('end', () => {
+      if (chunks.length === 0) return finish({});
+      try { finish(JSON.parse(Buffer.concat(chunks).toString('utf8'))); } catch { finish({}); }
+    });
+    req.on('timeout', () => finish(BODY_TOO_LARGE));
+    req.on('error', () => finish({}));
+  });
 }
 
 // ---- Rate limiting -----------------------------------------------------------
@@ -114,11 +116,13 @@ const MAX_SLOTS_PER_WORKER = 8; // server cap — a worker cannot self-declare u
 // otherwise carry path/SQL-adjacent metacharacters, control bytes, or megabyte payloads that leak
 // into branch names (`grid/<id>`), worktree paths, and event logs. Slugify to the safe charset and
 // length; if nothing survives, mint a fresh server-side id.
-const WORKER_ID_RE = /^[A-Za-z0-9._:-]{1,64}$/;
 function constrainWorkerId(raw, ownerId) {
-  if (typeof raw === 'string' && WORKER_ID_RE.test(raw)) return raw;
   if (typeof raw === 'string') {
-    const slug = raw.replace(/[^A-Za-z0-9._:-]/g, '-').slice(0, 64).replace(/^-+|-+$/g, '');
+    const slug = raw
+      .replace(/[^A-Za-z0-9._:-]/g, '-') // safe charset only
+      .replace(/\.{2,}/g, '-') // never '..' — no path/git-ref traversal if worker_id is ever interpolated into a path
+      .slice(0, 64)
+      .replace(/^[-.]+|[-.]+$/g, ''); // no leading/trailing dot or dash
     if (slug) return slug;
   }
   return mkWorkerId(ownerId || 'worker');
@@ -503,6 +507,10 @@ function redactFuelEntry(e) {
   const { note, payload_json, wallet_address, account_id, ...rest } = e;
   return rest;
 }
+function redactWorker(w) {
+  // Anonymous callers get coarse status only — never owner_id, the full manifest, or heartbeat ts.
+  return { id: w.id, status: w.status, trust_tier: w.trust_tier, active_slots: w.active_slots, max_slots: w.max_slots, reputation: w.reputation };
+}
 
 // ---- Lease sweep: requeue jobs whose worker died (lease expired) --------------
 
@@ -743,7 +751,7 @@ export function startBroker() {
         const jobs = listJobs(url.searchParams.get('objective'));
         return json(res, 200, authed ? jobs : jobs.map(redactJob));
       }
-      if (method === 'GET' && path === '/workers') return json(res, 200, listWorkers());
+      if (method === 'GET' && path === '/workers') return json(res, 200, authed ? listWorkers() : listWorkers().map(redactWorker));
       if (method === 'GET' && path === '/events') {
         // The event stream leaks objective titles, issue numbers, and worker activity — gate it
         // entirely for anonymous callers rather than trying to redact each payload.

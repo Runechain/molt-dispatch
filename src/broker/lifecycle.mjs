@@ -50,21 +50,19 @@ export async function onResult(jobId, result, ctx = {}) {
 
 function acceptJob(job, result = {}) {
   const meta = { model: result.model, provider: result.provider };
+  // Verify-don't-trust: snapshot EARNED trust BEFORE recording this acceptance. A zero-history
+  // worker must evaluate at the unproven prior (0.3 < repThreshold 0.4) so its FIRST result is
+  // held for secondary review — reading trust AFTER the accept we record below would lift it to
+  // ~0.667 and let every fresh identity skip the hold. The hold keys off earned trust, never the
+  // worker-controlled result.provider, so a low-rep worker can't bypass it by faking a provider.
+  const rep = trustScore(job.assigned_worker_id, job.capability_required);
+  const lowTrust = rep < FUEL.repThreshold;
+
   setJobStatus(job.id, 'accepted');
   recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id, meta);
   if ((job.checkpoint_seq || 0) > 0 || (job.attempts || 0) > 0) {
     recordEvent(job.assigned_worker_id, job.capability_required, 'resumed_successfully', job.id, meta);
   }
-
-  // Verify-don't-trust (security audit, item #2): the needs_review hold must key off EARNED
-  // trust, NOT the worker-controlled `result.provider`. Route ANY low-trust result through a
-  // secondary review regardless of provider, so a low-rep worker can't skip the hold by
-  // declaring a non-bedrock provider. Trust is read after the accept event (matching the prior
-  // bedrock-review semantics): a worker with accumulated bad history stays sub-threshold and is
-  // held; a clean worker isn't penalized merely for being new. The bedrock fuel-charge path is
-  // preserved below.
-  const rep = trustScore(job.assigned_worker_id, job.capability_required);
-  const lowTrust = rep < FUEL.repThreshold;
 
   // Settle fuel: charge the actual cost (or estimate) for paid (Bedrock) jobs.
   // Low-rep workers get their fuel held pending the secondary review before it settles.

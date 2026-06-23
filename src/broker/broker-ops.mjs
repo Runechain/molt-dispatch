@@ -91,6 +91,7 @@ async function staticCheck(spec, result, gt = {}) {
   const problems = scopeViolations(spec, changed);
   return {
     pass: problems.length === 0,
+    truth: truth != null, // AUTHORITATIVE only when the broker computed the diff itself
     notes: problems.join('; ') || `${changed.length} files in scope (${source})`,
     score: { changed_files: changed.length, source },
   };
@@ -101,9 +102,12 @@ async function staticCheck(spec, result, gt = {}) {
 // MINIMAL secret-free env (PATH/HOME/LANG only) — no parent gh/git/provider/fuel secrets leak
 // into a process that runs code the worker controls.
 async function automatedCheck(worktree, contract) {
+  // ran=false here means "no authoritative automated verification happened" — the validator's
+  // fail-closed (which requires static ground truth OR a real automated run for impl jobs) is
+  // what catches an unverified job, so a no-commands or missing-worktree case relies on that.
   const cmds = contract.validation?.automated || [];
-  if (cmds.length === 0) return { pass: true, notes: 'no automated checks configured' };
-  if (!existsSync(worktree)) return { pass: false, notes: `worktree missing: ${worktree}` };
+  if (cmds.length === 0) return { pass: true, ran: false, notes: 'no automated checks configured' };
+  if (!existsSync(worktree)) return { pass: false, ran: false, notes: `worktree missing: ${worktree}` };
 
   const results = [];
   for (const cmd of cmds) {
@@ -115,10 +119,10 @@ async function automatedCheck(worktree, contract) {
     });
     results.push({ cmd, code: r.code, tail: r.stdout.split('\n').slice(-4).join(' ').slice(0, 200) });
     if (r.code !== 0) {
-      return { pass: false, notes: `'${cmd}' failed (exit ${r.code})`, score: { results } };
+      return { pass: false, ran: true, notes: `'${cmd}' failed (exit ${r.code})`, score: { results } };
     }
   }
-  return { pass: true, notes: `${cmds.length} automated check(s) passed`, score: { results } };
+  return { pass: true, ran: true, notes: `${cmds.length} automated check(s) passed`, score: { results } }; // ran=AUTHORITATIVE
 }
 
 // Remove a job's worktree (branch is kept for merge). Called by lifecycle after an impl

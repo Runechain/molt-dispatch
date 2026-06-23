@@ -14,6 +14,7 @@ const { getDb, now } = await import('../src/broker/db.mjs');
 const { claimableJobsFor } = await import('../src/broker/scheduler.mjs');
 const { validateResult } = await import('../src/broker/validator.mjs');
 const { recordEvent } = await import('../src/broker/reputation.mjs');
+const { onResult } = await import('../src/broker/lifecycle.mjs');
 
 let passed = 0;
 const ok = (cond, msg) => { assert.ok(cond, msg); passed++; console.log(`  ✓ ${msg}`); };
@@ -88,6 +89,36 @@ console.log('#20 — review rubric schema is ENFORCED (was defined but never app
   // A review job with NO rubric at all is rejected (used to be silently skipped).
   v = await validateResult(reviewJob, { lease_token: 't', status: 'completed' }, { contract: {} });
   ok(v.pass === false, 'a review job with no rubric at all is rejected (no silent skip)');
+}
+
+console.log('re-audit #1 — a FRESH worker\'s first result is HELD for review (trust snapshot is pre-accept)');
+{
+  const o = obj();
+  const j = job(o, { type: 'inference', cap: 'inference', status: 'claimed', worker: 'FRESH' });
+  const jobRow = d.prepare('SELECT * FROM jobs WHERE id=?').get(j);
+  await onResult(jobRow.id, { lease_token: 't', status: 'completed' }, {});
+  ok(d.prepare('SELECT needs_review FROM objectives WHERE id=?').get(o).needs_review === 1, 'a zero-history worker\'s first accepted result sets needs_review (unproven prior 0.3 < 0.4, read BEFORE the accept)');
+
+  // A worker with earned history is NOT held.
+  for (let i = 0; i < 4; i++) recordEvent('SEASONED', 'inference', 'accepted', `seed-${i}`);
+  const o2 = obj();
+  const j2 = job(o2, { type: 'inference', cap: 'inference', status: 'claimed', worker: 'SEASONED' });
+  await onResult(d.prepare('SELECT * FROM jobs WHERE id=?').get(j2).id, { lease_token: 't', status: 'completed' }, {});
+  ok(d.prepare('SELECT needs_review FROM objectives WHERE id=?').get(o2).needs_review === 0, 'a worker with earned trust is NOT held');
+}
+
+console.log('re-audit #2 — fail-closed tracks AUTHORITATIVE truth, not "a check ran"');
+{
+  const o = obj();
+  const impl = job(o, { type: 'code.implementation', cap: 'code.implementation', status: 'claimed', worker: 'W' });
+  const implRow = d.prepare('SELECT * FROM jobs WHERE id=?').get(impl);
+  const envelope = { lease_token: 't', status: 'completed', changed_files: ['a.js'] };
+  // staticCheck ran but only ADVISORY (truth:false) — must NOT satisfy fail-closed.
+  let v = await validateResult(implRow, envelope, { staticCheck: async () => ({ pass: true, truth: false, notes: 'advisory' }) });
+  ok(v.pass === false && v.reasons.some((r) => /fail-closed/.test(r)), 'code.implementation with only an ADVISORY static pass is rejected (no broker ground truth)');
+  // staticCheck with real ground truth (truth:true) → authoritative → accepted.
+  v = await validateResult(implRow, envelope, { staticCheck: async () => ({ pass: true, truth: true, notes: 'ground-truth' }) });
+  ok(v.pass === true, 'code.implementation with AUTHORITATIVE ground-truth static passes');
 }
 
 console.log(`\n✅ security hardening: ${passed} checks passed`);

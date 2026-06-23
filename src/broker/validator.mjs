@@ -54,19 +54,22 @@ export async function validateResult(job, result, ctx = {}) {
   // ctx.staticCheck / ctx.automatedCheck are injected by the broker (buildResultCtx) once the
   // worktree exists. They run untrusted, worker-authored code, so the broker — not the worker —
   // must be the one to clear them.
+  // AUTHORITATIVE truth, not merely "a check function ran": static counts only when the broker
+  // computed the diff itself (r.truth), automated only when >=1 command actually executed (r.ran).
+  // An advisory-only static pass or a 'no automated checks configured' pass does NOT count.
   let ranGroundTruth = false;
   if (ctx.staticCheck) {
     const r = await ctx.staticCheck(job, result);
     recordValidation(job.id, 'static', r.pass ? 'pass' : 'fail', r.score, r.notes);
     layers.push({ layer: 'static', pass: r.pass });
-    ranGroundTruth = true;
+    if (r.truth) ranGroundTruth = true;
     if (!r.pass) reasons.push(`static: ${r.notes}`);
   }
   if (ctx.automatedCheck) {
     const r = await ctx.automatedCheck(job, result);
     recordValidation(job.id, 'automated', r.pass ? 'pass' : 'fail', r.score, r.notes);
     layers.push({ layer: 'automated', pass: r.pass });
-    ranGroundTruth = true;
+    if (r.ran) ranGroundTruth = true;
     if (!r.pass) reasons.push(`automated: ${r.notes}`);
   }
 

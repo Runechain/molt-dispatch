@@ -114,6 +114,12 @@ try {
 
   const leaseB = bedrockClaim.body.job.lease_token;
 
+  // Give the Bedrock worker EARNED reputation — verify-don't-trust holds an UNPROVEN worker's
+  // result for secondary review, so the charge-settles path below requires a proven worker (>0.4).
+  for (let i = 0; i < 3; i++) {
+    getDb().prepare("INSERT INTO reputation_events(worker_id,capability,event_type,delta,created_at) VALUES('bedrock-worker','inference','accepted',1,?)").run(now());
+  }
+
   // 5. On accept: reserve replaced by charge, balance decreases from reserve.
   const submit = await post(`/jobs/${jobId}/result`, {
     lease_token: leaseB,

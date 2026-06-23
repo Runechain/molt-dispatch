@@ -115,11 +115,15 @@ try {
   ok(rep.some((r) => r.worker_id === 'worker-B' && r.event_type === 'accepted' && r.provider === 'bedrock'), 'reputation: worker-B accepted, tagged provider=bedrock');
   ok(rep.some((r) => r.worker_id === 'worker-B' && r.event_type === 'resumed_successfully'), 'reputation: worker-B credited for a successful resume');
 
-  // 8. Objective is ready, then approves cleanly (no repo to merge).
+  // 8. The single job's worker is fresh (unproven), so its result is HELD for secondary review
+  //    (verify-don't-trust: an unproven worker can't self-approve work to the merge queue).
   const objs = await get('/objectives');
   ok(objs[0].status === 'ready_for_approval', 'objective is ready_for_approval after the single job accepts');
-  const approved = await post(`/objectives/${objs[0].id}/approve`);
-  ok(approved.body.status === 'approved', 'repo-less inference objective approves without merge');
+  let approved = await post(`/objectives/${objs[0].id}/approve`);
+  ok(approved.status === 409 && approved.body.needs_review, 'a fresh worker\'s result is HELD: approve blocked pending secondary review');
+  await post(`/objectives/${objs[0].id}/release`); // secondary review clears the hold
+  approved = await post(`/objectives/${objs[0].id}/approve`);
+  ok(approved.body.status === 'approved', 'after the hold clears, the repo-less inference objective approves without merge');
 
   // 9. Auth posture. SAFE DEFAULT (no MOLT_OPEN_GRID): MOLT_AUTH=1 gates every mutating endpoint,
   //    workers included. Opt-in MOLT_OPEN_GRID=1 opens worker endpoints but operator/spend stays gated.
