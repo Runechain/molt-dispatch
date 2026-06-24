@@ -3,6 +3,10 @@
 /artifacts/
 /worktrees/
 
+# Agent identity (ed25519 PRIVATE KEY) + worker pid — local-only, NEVER commit
+.molt-agent.json
+.molt-worker.pid
+
 # Isolated codex config home for grid runs (contains symlinked auth)
 /.codex-grid-home/
 
