@@ -9,7 +9,7 @@
 //   molt status [objective-id]        show objectives/jobs/workers
 //   molt dashboard                    open the web dashboard
 
-import { readFileSync, existsSync } from 'node:fs';
+import { readFileSync, existsSync, writeFileSync, unlinkSync } from 'node:fs';
 import { fileURLToPath } from 'node:url';
 import { resolve, dirname, join } from 'node:path';
 import { spawn } from 'node:child_process';
@@ -104,6 +104,41 @@ switch (cmd) {
       });
     } else usage();
     break;
+
+  // One command to join the LIVE grid. Zero config — sensible prod defaults baked in; you only
+  // claim once (it prints a link), then it pulls work until you `molt stop`.
+  case 'go': {
+    process.env.MOLT_BROKER_URL = process.env.MOLT_BROKER_URL || 'https://play.runechaingame.com/grid';
+    process.env.MOLT_GAME_URL = process.env.MOLT_GAME_URL || 'https://play.runechaingame.com';
+    if (!process.env.MOLT_REQUIRE_IDENTITY) process.env.MOLT_REQUIRE_IDENTITY = '1';
+    const { flags } = parseFlags([sub, ...rest].filter(Boolean));
+    const pidFile = join(PATHS.root, '.molt-worker.pid');
+    if (existsSync(pidFile)) {
+      console.error(`An agent looks already running (pid ${readFileSync(pidFile, 'utf8').trim()}). Run \`molt stop\` first, or delete ${pidFile}.`);
+      process.exit(1);
+    }
+    writeFileSync(pidFile, String(process.pid));
+    const cleanup = () => { try { unlinkSync(pidFile); } catch { /* ignore */ } };
+    process.on('exit', cleanup);
+    process.on('SIGTERM', () => process.exit(0));
+    console.log(`[molt] joining the grid at ${BROKER.url} (Ctrl-C or \`molt stop\` to leave)`);
+    const { startWorker } = await import('../src/worker/daemon.mjs');
+    await startWorker({
+      adapters: flags.adapters ? String(flags.adapters).split(',').map((s) => s.trim()) : undefined,
+      owner: flags.owner,
+      maxSlots: flags['max-slots'] ? Number(flags['max-slots']) : undefined,
+    });
+    break;
+  }
+  case 'stop': {
+    const pidFile = join(PATHS.root, '.molt-worker.pid');
+    if (!existsSync(pidFile)) { console.log('No agent is running.'); break; }
+    const pid = Number(readFileSync(pidFile, 'utf8').trim());
+    try { process.kill(pid, 'SIGTERM'); console.log(`[molt] stopped agent (pid ${pid}).`); }
+    catch { console.log(`[molt] no live process for pid ${pid}; cleared stale pid file.`); }
+    try { unlinkSync(pidFile); } catch { /* ignore */ }
+    break;
+  }
 
   case 'objective':
     if (sub === 'create') {
@@ -331,6 +366,9 @@ switch (cmd) {
 
 function usage() {
   console.log(`molt — Distributed Agent Compute Grid  v${version()}
+
+  molt go                            join the LIVE grid as an agent (zero config; claim once, then it works)
+  molt stop                          stop the running agent
 
   molt doctor
   molt broker start                  (set MOLT_AUTH=1 to require API keys)

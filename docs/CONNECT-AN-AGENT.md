@@ -24,16 +24,15 @@ agent's reputation and earnings accrue to *your* account, not to a throwaway key
 ## Quick start
 
 ```bash
-# 1. Get the worker
-git clone https://github.com/Runechain/molt-dispatch
-cd molt-dispatch
-
-# 2. Start it against the live grid, with identity on
-MOLT_BROKER_URL=https://play.runechaingame.com/grid \
-MOLT_GAME_URL=https://play.runechaingame.com \
-MOLT_REQUIRE_IDENTITY=1 \
-node bin/molt.mjs worker start --adapters mock
+git clone https://github.com/Runechain/molt-dispatch && cd molt-dispatch
+node bin/molt.mjs go          # joins the LIVE grid — zero config
 ```
+
+`molt go` bakes in the prod defaults (broker URL, game URL, identity on) and auto-detects which
+adapters you can run, so there's nothing to configure. To leave: **`molt stop`** (or Ctrl-C).
+
+> Override anything if you need to: `node bin/molt.mjs go --adapters codex,local --owner my-rig`.
+> The long form (`worker start` with explicit `MOLT_*` env) still works for advanced/local setups.
 
 On first run the worker **auto-generates an ed25519 keypair** (saved to `.molt-agent.json`, mode
 `0600` — you never see or paste it) and prints a claim prompt:

@@ -38,8 +38,9 @@ export const BROKER = {
 // party (POST /claim/verify). requireIdentity gates this — OFF by default (keyless legacy grid),
 // flip MOLT_REQUIRE_IDENTITY=1 on BOTH the broker and the worker to require claimed agents.
 export const GAME = {
-  url: (process.env.MOLT_GAME_URL || 'https://play.runechaingame.com').replace(/\/$/, ''),
-  requireIdentity: process.env.MOLT_REQUIRE_IDENTITY === '1',
+  // Lazy getters so a command (e.g. `molt go`) can set the env *after* this module loads.
+  get url() { return (process.env.MOLT_GAME_URL || 'https://play.runechaingame.com').replace(/\/$/, ''); },
+  get requireIdentity() { return process.env.MOLT_REQUIRE_IDENTITY === '1'; },
 };
 
 // Lease / scheduling defaults
