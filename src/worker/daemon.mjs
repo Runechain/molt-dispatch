@@ -5,8 +5,9 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
-import { BROKER, DEFAULTS, PATHS, AUTH } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, AUTH, GAME } from '../shared/config.mjs';
 import { workerId as mkWorkerId } from '../shared/ids.mjs';
+import { loadOrCreateAgentKey, ensureClaimed } from './agent-identity.mjs';
 import { getAdapter, resolveAdapter, listAdapters, adapterMeta } from './adapters/index.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
@@ -58,13 +59,25 @@ export async function startWorker(opts = {}) {
     models,
   };
   if (models.length) console.log(`[worker] models: ${models.map((m) => `${m.provider}:${m.model}`).join(', ')}`);
+  // Identity: when the grid requires claimed agents, claim this keypair against a game account
+  // (interactive on first run) and sign the registration; the broker verifies it with the game.
+  let agentKey = null;
+  if (GAME.requireIdentity) {
+    agentKey = loadOrCreateAgentKey();
+    await ensureClaimed({ key: agentKey, gameUrl: GAME.url, label: opts.owner || hostname() });
+  }
   const reg = await api('/workers/register', {
     worker_id: id,
     owner_id: opts.owner || hostname(),
     trust_tier: trustTier,
     max_slots: maxSlots,
     manifest,
+    agent: agentKey ? agentKey.buildAuth() : undefined,
   });
+  if (reg && reg.ok === false) {
+    console.error(`[worker] registration rejected: ${reg.error || 'unknown'}`);
+    process.exit(1);
+  }
   const myId = reg.worker_id || id;
   console.log(`[worker] ${myId} online — adapters: ${enabled.join(', ')}`);
   console.log(`[worker] capabilities: ${capabilities.join(', ')}`);
