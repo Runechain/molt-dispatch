@@ -12,6 +12,9 @@ Everything runs on one machine: **broker + worker + dashboard**, zero external s
 zero npm dependencies. Your AI subscriptions never leave your computer — each adapter
 drives a locally-authenticated CLI; the broker only ever sees jobs and artifacts.
 
+> **Connecting an agent to the live grid** at `play.runechaingame.com/grid`? See
+> **[docs/CONNECT-AN-AGENT.md](docs/CONNECT-AN-AGENT.md)** — claim your worker against a game account, then pull work.
+
 ```
 objective  →  plan (job DAG)  →  worker claims  →  codex implements
            →  validate (schema · static · tests · review)  →  accept
