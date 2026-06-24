@@ -280,11 +280,27 @@ export function nextSeq(name) {
 }
 
 // Append to the event log (used everywhere for the audit trail / dashboard feed).
+// Live event subscribers (the SSE stream). Kept in-process; logEvent fans out to them AFTER the row
+// is durably written, so a subscriber crash can never lose or block the persisted event.
+const eventSubscribers = new Set();
+export function subscribeEvents(fn) {
+  eventSubscribers.add(fn);
+  return () => eventSubscribers.delete(fn);
+}
+
 export function logEvent(entity_type, entity_id, event_type, payload) {
   const d = getDb();
+  const id = eventId();
+  const created_at = now();
   d.prepare(
     'INSERT INTO events(id, entity_type, entity_id, event_type, payload_json, created_at) VALUES(?,?,?,?,?,?)'
-  ).run(eventId(), entity_type, entity_id, event_type, payload ? JSON.stringify(payload) : null, now());
+  ).run(id, entity_type, entity_id, event_type, payload ? JSON.stringify(payload) : null, created_at);
+  if (eventSubscribers.size) {
+    const evt = { id, entity_type, entity_id, event_type, payload: payload || null, created_at };
+    for (const fn of eventSubscribers) {
+      try { fn(evt); } catch { /* a bad subscriber must never break event logging */ }
+    }
+  }
 }
 
 // Small helpers so callers don't sprinkle JSON.parse everywhere.

@@ -140,6 +140,43 @@ switch (cmd) {
     try { unlinkSync(pidFile); } catch { /* ignore */ }
     break;
   }
+  case 'logs': {
+    // Live tail of the grid's event stream (Server-Sent Events) — what's happening, as it happens.
+    // Defaults to the prod broker; pass your operator key via MOLT_API_KEY or --key. Ctrl-C to stop.
+    process.env.MOLT_BROKER_URL = process.env.MOLT_BROKER_URL || 'https://play.runechaingame.com/grid';
+    const { flags } = parseFlags([sub, ...rest].filter(Boolean));
+    if (flags.key) process.env.MOLT_API_KEY = String(flags.key);
+    const headers = { accept: 'text/event-stream' };
+    if (process.env.MOLT_API_KEY) headers.authorization = `Bearer ${process.env.MOLT_API_KEY}`;
+    const target = `${BROKER.url}/events/stream`;
+    console.log(`[molt] tailing ${target}  (Ctrl-C to stop)`);
+    let res;
+    try { res = await fetch(target, { headers }); }
+    catch (e) { console.error(`logs: cannot reach ${target} (${e.message})`); process.exit(1); }
+    if (!res.ok || !res.body) { console.error(`logs: HTTP ${res.status} — ${await res.text().catch(() => '')}`); process.exit(1); }
+    const reader = res.body.getReader();
+    const dec = new TextDecoder();
+    let buf = '';
+    for (;;) {
+      const { value, done } = await reader.read();
+      if (done) { console.log('[molt] stream ended.'); break; }
+      buf += dec.decode(value, { stream: true });
+      let i;
+      while ((i = buf.indexOf('\n\n')) >= 0) {
+        const frame = buf.slice(0, i); buf = buf.slice(i + 2);
+        const line = frame.split('\n').find((l) => l.startsWith('data:'));
+        if (!line) continue; // keepalive comment
+        let e; try { e = JSON.parse(line.slice(5).trim()); } catch { continue; }
+        if (e && e.ok && e.live === false) { console.log('[molt] connected — but this broker is gated and your key is missing/invalid; set MOLT_API_KEY to see events.'); continue; }
+        if (e && e.event_type) {
+          const t = new Date(e.created_at).toLocaleTimeString();
+          const tail = e.payload && Object.keys(e.payload).length ? '  ' + JSON.stringify(e.payload) : '';
+          console.log(`${t}  ${String(e.event_type).padEnd(18)} ${e.entity_type}/${e.entity_id}${tail}`);
+        }
+      }
+    }
+    break;
+  }
 
   case 'objective':
     if (sub === 'create') {
@@ -370,6 +407,7 @@ function usage() {
 
   molt go                            join the LIVE grid as an agent (zero config; claim once, then it works)
   molt stop                          stop the running agent
+  molt logs [--key <operator-key>]   live-tail the grid event stream (what's happening, as it happens)
 
   molt doctor
   molt broker start                  (set MOLT_AUTH=1 to require API keys)
