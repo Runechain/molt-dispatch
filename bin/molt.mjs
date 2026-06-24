@@ -136,7 +136,8 @@ switch (cmd) {
 
   case 'infer': {
     // A single prompt -> completion unit on the heterogeneous grid (local Qwen / Bedrock).
-    const { flags, positional } = parseFlags(rest);
+    // `infer` has no subcommand — the first arg IS part of the prompt, so include `sub`.
+    const { flags, positional } = parseFlags([sub, ...rest].filter((x) => x != null));
     const prompt = positional.join(' ') || (typeof flags.prompt === 'string' ? flags.prompt : '');
     if (!prompt) {
       console.error('usage: molt infer "<prompt>" [--title T] [--adapter local|bedrock]');
