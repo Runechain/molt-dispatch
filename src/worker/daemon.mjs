@@ -1,6 +1,11 @@
 // molt-worker: a local daemon that pulls work from the broker and executes it with a
 // locally-authenticated adapter. The broker never sees credentials — the adapter owns
 // the logged-in session on this machine (WHITEPAPER §5/§9).
+//
+// Durability contract ("just tell it go or stop; it survives breakage"): every network call is
+// bounded by a timeout, every failure retries with capped jittered backoff instead of crashing, the
+// worker RE-REGISTERS if the broker forgets it (restart/eviction), and `stop` drains the in-flight
+// job (submits its result, cleans its worktree) before exiting.
 
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
@@ -11,7 +16,12 @@ import { loadOrCreateAgentKey, ensureClaimed } from './agent-identity.mjs';
 import { getAdapter, resolveAdapter, listAdapters, adapterMeta } from './adapters/index.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
-let inflight = null; // AbortController for the job currently running (so SIGINT can stop it)
+// Capped exponential backoff with jitter — so a fleet recovering from a shared outage doesn't
+// stampede the broker in lockstep. `attempt` grows the delay; jitter (0.5–1.5x) de-synchronizes.
+const backoff = (attempt, base = 1000, cap = 30000) =>
+  Math.min(cap, base * 2 ** Math.min(attempt, 6)) * (0.5 + Math.random());
+
+let inflight = null; // AbortController for the job currently running (stop/reassign can abort it)
 
 function authHeaders() {
   const h = { 'content-type': 'application/json' };
@@ -19,13 +29,19 @@ function authHeaders() {
   return h;
 }
 
-async function api(path, body) {
+// POST to the broker. Bounded by a timeout (a hung connection must not freeze a loop forever) and
+// surfaces the HTTP status as `_status` so callers can distinguish 429/5xx from a real result.
+async function api(path, body, { timeoutMs = 8000 } = {}) {
   const res = await fetch(`${BROKER.url}${path}`, {
     method: 'POST',
     headers: authHeaders(),
     body: JSON.stringify(body),
+    signal: AbortSignal.timeout(timeoutMs),
   });
-  return res.json();
+  let out = {};
+  try { out = await res.json(); } catch { out = {}; }
+  if (out && typeof out === 'object') out._status = res.status;
+  return out;
 }
 
 export async function startWorker(opts = {}) {
@@ -59,53 +75,122 @@ export async function startWorker(opts = {}) {
     models,
   };
   if (models.length) console.log(`[worker] models: ${models.map((m) => `${m.provider}:${m.model}`).join(', ')}`);
-  // Identity: when the grid requires claimed agents, claim this keypair against a game account
-  // (interactive on first run) and sign the registration; the broker verifies it with the game.
-  let agentKey = null;
-  if (GAME.requireIdentity) {
-    agentKey = loadOrCreateAgentKey();
-    await ensureClaimed({ key: agentKey, gameUrl: GAME.url, label: opts.owner || hostname() });
-  }
-  const reg = await api('/workers/register', {
+
+  // Identity: when the grid requires claimed agents, sign each registration with this keypair; the
+  // broker verifies it with the game. We register FIRST and only run the interactive claim if the
+  // broker reports we're not bound yet — so an already-claimed agent reconnects with NO prompt.
+  const agentKey = GAME.requireIdentity ? loadOrCreateAgentKey() : null;
+  const NEEDS_CLAIM = new Set(['agent_not_claimed', 'agent_not_verified', 'agent_credential_missing']);
+  const TRANSIENT = new Set(['identity_authority_unreachable', 'agent_auth_stale']);
+  const registerBody = () => ({
     worker_id: id,
     owner_id: opts.owner || hostname(),
     trust_tier: trustTier,
     max_slots: maxSlots,
     manifest,
-    agent: agentKey ? agentKey.buildAuth() : undefined,
+    agent: agentKey ? agentKey.buildAuth() : undefined, // fresh-signed each attempt (bounds replay)
   });
-  if (reg && reg.ok === false) {
-    console.error(`[worker] registration rejected: ${reg.error || 'unknown'}`);
-    process.exit(1);
+
+  // Register the worker, retrying durably through every failure mode. Reusable so the heartbeat /
+  // claim loops can re-register if the broker later forgets this worker. `interactive:true` allows
+  // the one-time human claim prompt (startup only); re-registrations run silently.
+  let claimedOnce = false;
+  async function register({ interactive = false } = {}) {
+    let attempt = 0, settling = false, staleWarned = false;
+    for (;;) {
+      let reg;
+      try {
+        reg = await api('/workers/register', registerBody(), { timeoutMs: 15000 });
+      } catch {
+        console.log('[worker] broker unreachable — retrying…');
+        await sleep(backoff(attempt++));
+        continue;
+      }
+      const status = reg._status || 0;
+      // Non-2xx WITHOUT an identity verdict (rate limit, 5xx, transient auth) → back off + retry,
+      // never mistake it for a successful registration.
+      if (status >= 400 && reg.ok !== false) {
+        console.log(`[worker] register HTTP ${status} — retrying…`);
+        await sleep(backoff(attempt++));
+        continue;
+      }
+      if (reg && reg.ok === false) {
+        if (agentKey && NEEDS_CLAIM.has(reg.error)) {
+          if (interactive && !claimedOnce) {
+            // First confirmation on this account — waits indefinitely, auto-refreshing the code.
+            await ensureClaimed({ key: agentKey, gameUrl: GAME.url, label: opts.owner || hostname(), timeoutMs: 0 });
+            claimedOnce = true; attempt = 0; continue;
+          }
+          // Already confirmed (or a silent re-register): the binding may still be propagating to the
+          // broker — keep retrying with backoff instead of exiting on a transient consistency lag.
+          if (!settling) { console.log('[worker] waiting for the identity binding to settle…'); settling = true; }
+          await sleep(backoff(attempt++, 1000, 15000));
+          continue;
+        }
+        if (TRANSIENT.has(reg.error)) {
+          if (reg.error === 'agent_auth_stale' && attempt >= 6 && !staleWarned) {
+            console.error("[worker] agent_auth_stale persists — this machine's clock is likely >5min off the broker; NTP-sync it.");
+            staleWarned = true;
+          }
+          console.log(`[worker] ${reg.error} — retrying…`);
+          await sleep(backoff(attempt++));
+          continue;
+        }
+        if (reg.error === 'claim was denied' || reg.error === 'agent_denied') {
+          console.error('[worker] this agent was denied — exiting. Re-run to claim a fresh key.');
+          process.exit(1);
+        }
+        // Unrecognized rejection — durable by default: back off and retry rather than crash.
+        console.log(`[worker] registration rejected (${reg.error || 'unknown'}) — retrying…`);
+        await sleep(backoff(attempt++));
+        continue;
+      }
+      return reg.worker_id || id;
+    }
   }
-  const myId = reg.worker_id || id;
+
+  const myId = await register({ interactive: true });
   console.log(`[worker] ${myId} online — adapters: ${enabled.join(', ')}`);
   console.log(`[worker] capabilities: ${capabilities.join(', ')}`);
 
   let activeSlots = 0;
   let stopped = false;
-  process.on('SIGINT', () => {
+  let forceTimer = null;
+  // Graceful shutdown for BOTH signals: SIGINT (Ctrl-C) and SIGTERM (what `molt stop` sends). Flip
+  // `stopped`, abort the in-flight job so it submits a result + cleans its worktree, then exit once
+  // the loops drain. A hard cap bounds `stop` even if a job ignores the abort; a 2nd signal forces.
+  const shutdown = (sig) => {
+    if (stopped) { process.exit(0); return; }
     stopped = true;
-    if (inflight) {
-      try {
-        inflight.abort();
-      } catch {
-        /* ignore */
-      }
-    }
-    console.log('\n[worker] shutting down');
-    process.exit(0);
-  });
+    console.log(`\n[worker] ${sig} — finishing in-flight work, then stopping…`);
+    if (inflight) { try { inflight.abort(); } catch { /* ignore */ } }
+    forceTimer = setTimeout(() => process.exit(0), 12000);
+    forceTimer.unref?.();
+  };
+  process.on('SIGINT', () => shutdown('SIGINT'));
+  process.on('SIGTERM', () => shutdown('SIGTERM'));
 
-  // heartbeat
+  // heartbeat — also a second, independent recovery trigger: if the broker reports it no longer
+  // knows this worker, re-register (works even while the claim loop is busy in a job).
   (async function heartbeatLoop() {
+    let fails = 0;
     while (!stopped) {
-      await api('/workers/heartbeat', { worker_id: myId }).catch(() => {});
+      try {
+        const hb = await api('/workers/heartbeat', { worker_id: myId }, { timeoutMs: 5000 });
+        if (hb && hb.error === 'unknown_worker') {
+          console.warn('[worker] broker no longer has our registration — re-registering…');
+          await register({ interactive: false });
+        }
+        fails = 0;
+      } catch {
+        if (++fails === 3) console.warn('[worker] heartbeats failing — broker may have dropped this worker; jobs may be reassigned.');
+      }
       await sleep(DEFAULTS.heartbeatSeconds * 1000);
     }
   })();
 
   // claim/work loop
+  let claimAttempt = 0;
   while (!stopped) {
     if (activeSlots >= maxSlots) {
       await sleep(DEFAULTS.claimPollSeconds * 1000);
@@ -120,11 +205,26 @@ export async function startWorker(opts = {}) {
         max_slots: maxSlots,
         active_slots: activeSlots,
       });
-    } catch (err) {
-      console.log('[worker] broker unreachable, retrying...');
-      await sleep(DEFAULTS.claimPollSeconds * 1000);
+    } catch {
+      console.log('[worker] broker unreachable, retrying…');
+      await sleep(backoff(claimAttempt++, DEFAULTS.claimPollSeconds * 1000, 30000));
       continue;
     }
+    if (stopped) break;
+
+    // Broker forgot us (fresh DB / eviction) → re-register instead of polling an empty void forever.
+    if (claim && claim.error === 'unknown_worker') {
+      console.warn('[worker] broker lost our registration — re-registering…');
+      await register({ interactive: false });
+      claimAttempt = 0;
+      continue;
+    }
+    // Throttled → back off (don't mistake a 429 for "no work available").
+    if (claim && claim._status === 429) {
+      await sleep(backoff(claimAttempt++, DEFAULTS.claimPollSeconds * 1000, 30000));
+      continue;
+    }
+    claimAttempt = 0;
 
     if (!claim || !claim.job) {
       await sleep(DEFAULTS.claimPollSeconds * 1000);
@@ -138,6 +238,11 @@ export async function startWorker(opts = {}) {
     });
     activeSlots--;
   }
+
+  // Loops drained on `stopped` — exit cleanly (in-flight result submitted, worktree cleaned).
+  if (forceTimer) clearTimeout(forceTimer);
+  console.log('[worker] stopped.');
+  process.exit(0);
 }
 
 async function executeJob(job, enabledNames, myId) {
@@ -168,7 +273,15 @@ async function executeJob(job, enabledNames, myId) {
       // broker keeps the latest checkpoint and the next worker continues from it.
       checkpoint: job.checkpoint || null,
       signal: inflight.signal,
-      saveCheckpoint: (state) => api(`/jobs/${job.job_id}/checkpoint`, { lease_token: job.lease_token, state }),
+      // If the broker has reassigned/forgotten the job (404/409), stop burning compute on it.
+      saveCheckpoint: async (state) => {
+        const r = await api(`/jobs/${job.job_id}/checkpoint`, { lease_token: job.lease_token, state }).catch(() => null);
+        if (r && (r._status === 404 || r._status === 409)) {
+          console.warn(`[worker] checkpoint rejected (${r.error || r._status}) — job was reassigned; aborting to stop wasting compute.`);
+          try { inflight?.abort(); } catch { /* ignore */ }
+        }
+        return r;
+      },
     };
     if (job.checkpoint) console.log(`[worker] resuming ${job.job_id} from checkpoint`);
 
@@ -184,8 +297,12 @@ async function executeJob(job, enabledNames, myId) {
       artifacts = [{ kind: 'completion', path: p }, ...artifacts.filter((a) => a.kind !== 'completion')];
     }
 
-    await submit(job, { lease_token: job.lease_token, ...draft, artifacts });
-    console.log(`[worker] submitted ${job.job_id} (${draft.status})`);
+    const result = await submit(job, { lease_token: job.lease_token, ...draft, artifacts });
+    if (result && (result.error === 'submit_failed' || result._status === 404 || result._status === 409)) {
+      console.warn(`[worker] ${job.job_id} result not accepted (${result.error || result._status}).`);
+    } else {
+      console.log(`[worker] submitted ${job.job_id} (${draft.status})`);
+    }
   } catch (err) {
     await submit(job, { lease_token: job.lease_token, status: 'failed', error: String(err?.message || err) });
     console.error(`[worker] ${job.job_id} failed:`, err?.message || err);
@@ -205,15 +322,43 @@ function artifactsDirFor(job) {
   return dir;
 }
 
-async function submit(job, body) {
-  const res = await fetch(`${BROKER.url}/jobs/${job.job_id}/result`, {
-    method: 'POST',
-    headers: authHeaders(),
-    body: JSON.stringify(body),
-  });
-  const out = await res.json().catch(() => ({}));
-  if (out.verdict) {
-    console.log(`[worker] broker verdict: ${out.verdict.pass ? 'PASS' : 'FAIL'}${out.verdict.reasons?.length ? ' — ' + out.verdict.reasons.join('; ') : ''}`);
+// Submit a result durably: bounded by a timeout, retried with backoff on transient failure, and —
+// if it still can't be delivered — persisted to disk so finished (possibly paid-for) work is never
+// silently lost. A 404/409 means the job was reassigned/the lease expired: terminal, so we stop.
+async function submit(job, body, { retries = 3 } = {}) {
+  let lastErr = null;
+  for (let attempt = 0; attempt <= retries; attempt++) {
+    try {
+      const res = await fetch(`${BROKER.url}/jobs/${job.job_id}/result`, {
+        method: 'POST',
+        headers: authHeaders(),
+        body: JSON.stringify(body),
+        signal: AbortSignal.timeout(30000),
+      });
+      const out = await res.json().catch(() => ({}));
+      if (res.ok) {
+        if (out.verdict) {
+          console.log(`[worker] broker verdict: ${out.verdict.pass ? 'PASS' : 'FAIL'}${out.verdict.reasons?.length ? ' — ' + out.verdict.reasons.join('; ') : ''}`);
+        }
+        return out;
+      }
+      if (res.status === 404 || res.status === 409) {
+        console.warn(`[worker] result for ${job.job_id} rejected (${out.error || res.status}) — job was reassigned; dropping.`);
+        return { ...out, _status: res.status };
+      }
+      lastErr = new Error(`HTTP ${res.status}`);
+    } catch (e) {
+      lastErr = e;
+    }
+    if (attempt < retries) await sleep(backoff(attempt, 1000, 15000));
   }
-  return out;
+  // Exhausted retries — don't silently lose finished work; persist it for replay + log loudly.
+  try {
+    const p = join(artifactsDirFor(job), 'unsent-result.json');
+    writeFileSync(p, JSON.stringify(body, null, 2));
+    console.error(`[worker] could not submit ${job.job_id} after ${retries} retries (${lastErr?.message}); saved result to ${p}`);
+  } catch {
+    console.error(`[worker] could not submit ${job.job_id} (${lastErr?.message}) and could not persist it.`);
+  }
+  return { error: 'submit_failed' };
 }

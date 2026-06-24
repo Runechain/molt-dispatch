@@ -159,7 +159,10 @@ async function registerWorker(body) {
 }
 
 function heartbeat(body) {
-  getDb().prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', body.worker_id);
+  // If the worker row is gone (fresh DB / eviction), the UPDATE matches 0 rows. Signal that so the
+  // worker can re-register instead of heartbeating into the void forever.
+  const r = getDb().prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', body.worker_id);
+  if (r.changes === 0) return { ok: false, error: 'unknown_worker' };
   return { ok: true };
 }
 
@@ -170,7 +173,9 @@ function claim(body) {
   // server state — capabilities/max_slots from the registered manifest row, active_slots from a
   // live count, trust from earned reputation — never from the claim body.
   const row = d.prepare('SELECT * FROM workers WHERE id=?').get(workerId);
-  if (!row) return { job: null, reason: 'worker not registered' };
+  // `error: 'unknown_worker'` is machine-detectable so the worker re-registers (vs. idling as if the
+  // queue were empty). `reason` kept for back-compat with any human-readable consumers.
+  if (!row) return { job: null, reason: 'worker not registered', error: 'unknown_worker' };
   d.prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', workerId);
   const manifest = (() => { try { return JSON.parse(row.manifest_json || '{}'); } catch { return {}; } })();
   const activeSlots = d.prepare("SELECT COUNT(*) AS c FROM assignments WHERE worker_id=? AND status='running'").get(workerId).c;

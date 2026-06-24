@@ -73,9 +73,21 @@ const ok = (l) => { n++; if (process.env.VERBOSE) console.log('  ok -', l); };
   assert.ok(lines.join('\n').includes('K7PQ-3RX9'), 'prints the code for the operator');
   ok('ensureClaimed: start -> poll(pending) -> poll(confirmed)');
 
-  // denied / expired bail out
-  await assert.rejects(() => ensureClaimed({ key, gameUrl: 'https://g', fetch: async (u) => u.endsWith('/claim/start') ? jsonRes(true, 200, { code: 'X' }) : jsonRes(true, 200, { status: 'expired' }), log: () => {}, pollMs: 1 }), /expired/);
-  ok('ensureClaimed rejects on expiry');
+  // explicit denial bails out
+  await assert.rejects(() => ensureClaimed({ key, gameUrl: 'https://g', fetch: async (u) => u.endsWith('/claim/start') ? jsonRes(true, 200, { code: 'X' }) : jsonRes(true, 200, { status: 'denied' }), log: () => {}, pollMs: 1 }), /denied/);
+  ok('ensureClaimed rejects on explicit denial');
+
+  // EXPIRY auto-refreshes (turnkey: never crash while waiting) — re-issues a code, then confirms.
+  let starts = 0, polls2 = 0;
+  const refreshFetch = async (url) => {
+    if (url.endsWith('/claim/start')) { starts++; return jsonRes(true, 200, { code: `C${starts}`, claimUrl: 'https://g/claim' }); }
+    if (url.includes('/claim/poll')) { polls2++; return jsonRes(true, 200, polls2 < 2 ? { status: 'expired' } : { status: 'confirmed', accountId: 'acct_human' }); }
+    throw new Error('unexpected ' + url);
+  };
+  const r2 = await ensureClaimed({ key, gameUrl: 'https://g', fetch: refreshFetch, log: () => {}, pollMs: 1 });
+  assert.equal(r2.accountId, 'acct_human', 'auto-refresh then confirm');
+  assert.ok(starts >= 2, 're-issued a fresh code on expiry (no crash)');
+  ok('ensureClaimed auto-refreshes an expired code instead of crashing');
 }
 
 // ---- 4. broker verifyAgentClaim ------------------------------------------------------------------

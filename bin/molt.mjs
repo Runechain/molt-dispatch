@@ -120,7 +120,8 @@ switch (cmd) {
     writeFileSync(pidFile, String(process.pid));
     const cleanup = () => { try { unlinkSync(pidFile); } catch { /* ignore */ } };
     process.on('exit', cleanup);
-    process.on('SIGTERM', () => process.exit(0));
+    // NOTE: SIGTERM (what `molt stop` sends) is handled INSIDE the daemon so it can drain the
+    // in-flight job (submit its result, clean its worktree) before exiting — see startWorker().
     console.log(`[molt] joining the grid at ${BROKER.url} (Ctrl-C or \`molt stop\` to leave)`);
     const { startWorker } = await import('../src/worker/daemon.mjs');
     await startWorker({

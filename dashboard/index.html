@@ -4,7 +4,19 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>molt · grid dispatch</title>
-    <link rel="stylesheet" href="/dashboard/style.css" />
+    <script>
+      // The dashboard may be served behind a path prefix (e.g. /grid/dashboard on the deployed
+      // broker behind the ALB). Derive it from our own URL so the stylesheet, script, and every API
+      // call resolve correctly in BOTH local (/dashboard) and prod (/grid/dashboard).
+      (function () {
+        var prefix = location.pathname.replace(/\/dashboard\/?$/, '');
+        window.MOLT_PREFIX = prefix; // '' locally, '/grid' on prod
+        var base = document.createElement('base');
+        base.href = location.origin + prefix + '/dashboard/';
+        document.head.appendChild(base); // relative asset URLs below resolve against this
+      })();
+    </script>
+    <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <header>
@@ -30,6 +42,6 @@
       </section>
     </main>
 
-    <script src="/dashboard/app.js"></script>
+    <script src="app.js"></script>
   </body>
 </html>
