@@ -2,8 +2,13 @@
 
 const $ = (id) => document.getElementById(id);
 
+// Path prefix the dashboard is served under ('' locally, '/grid' behind the prod ALB). Set by the
+// inline bootstrap in index.html from location.pathname; every broker call is prefixed with it.
+const PREFIX = String(window.MOLT_PREFIX || '').replace(/\/$/, '');
+const api = (path) => PREFIX + path;
+
 async function getJSON(path) {
-  const res = await fetch(path);
+  const res = await fetch(api(path));
   if (!res.ok) throw new Error(`${path} -> ${res.status}`);
   return res.json();
 }
@@ -54,7 +59,7 @@ async function renderObjectives() {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       btn.textContent = 'merging…';
-      const r = await fetch(`/objectives/${btn.dataset.approve}/approve`, { method: 'POST' }).then((x) => x.json());
+      const r = await fetch(api(`/objectives/${btn.dataset.approve}/approve`), { method: 'POST' }).then((x) => x.json());
       if (r.error) {
         btn.textContent = '✗ ' + r.error;
       }

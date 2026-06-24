@@ -5,7 +5,7 @@ import http from 'node:http';
 import { createHash } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
-import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
+import { getDb, now, nextSeq, logEvent, parseRow, transaction, subscribeEvents } from './db.mjs';
 import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
 import { BROKER, DEFAULTS, PATHS, FUEL, GAME } from '../shared/config.mjs';
 import { verifyAgentClaim } from './agent-verify.mjs';
@@ -159,7 +159,10 @@ async function registerWorker(body) {
 }
 
 function heartbeat(body) {
-  getDb().prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', body.worker_id);
+  // If the worker row is gone (fresh DB / eviction), the UPDATE matches 0 rows. Signal that so the
+  // worker can re-register instead of heartbeating into the void forever.
+  const r = getDb().prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', body.worker_id);
+  if (r.changes === 0) return { ok: false, error: 'unknown_worker' };
   return { ok: true };
 }
 
@@ -170,7 +173,9 @@ function claim(body) {
   // server state — capabilities/max_slots from the registered manifest row, active_slots from a
   // live count, trust from earned reputation — never from the claim body.
   const row = d.prepare('SELECT * FROM workers WHERE id=?').get(workerId);
-  if (!row) return { job: null, reason: 'worker not registered' };
+  // `error: 'unknown_worker'` is machine-detectable so the worker re-registers (vs. idling as if the
+  // queue were empty). `reason` kept for back-compat with any human-readable consumers.
+  if (!row) return { job: null, reason: 'worker not registered', error: 'unknown_worker' };
   d.prepare('UPDATE workers SET last_heartbeat=?, status=? WHERE id=?').run(now(), 'online', workerId);
   const manifest = (() => { try { return JSON.parse(row.manifest_json || '{}'); } catch { return {}; } })();
   const activeSlots = d.prepare("SELECT COUNT(*) AS c FROM assignments WHERE worker_id=? AND status='running'").get(workerId).c;
@@ -770,6 +775,25 @@ export function startBroker() {
         // entirely for anonymous callers rather than trying to redact each payload.
         if (!authed) return json(res, 200, []);
         return json(res, 200, listEvents(Number(url.searchParams.get('limit') || 100)));
+      }
+      if (method === 'GET' && path === '/events/stream') {
+        // Live event stream (Server-Sent Events) — the operator's `molt logs` tail. Same gating as
+        // /events: an authed operator gets the full live stream; an anonymous caller on a gated
+        // broker gets an open-but-empty stream (consistent with /events returning []).
+        res.writeHead(200, {
+          'content-type': 'text/event-stream',
+          'cache-control': 'no-store',
+          connection: 'keep-alive',
+          'x-accel-buffering': 'no', // ask proxies/ALB not to buffer the stream
+        });
+        res.write('retry: 3000\n\n');
+        res.write(`event: hello\ndata: ${JSON.stringify({ ok: true, time: now(), live: authed })}\n\n`);
+        const hb = setInterval(() => { try { res.write(': keepalive\n\n'); } catch { /* ignore */ } }, 15000);
+        const unsub = authed
+          ? subscribeEvents((evt) => { try { res.write(`data: ${JSON.stringify(evt)}\n\n`); } catch { /* ignore */ } })
+          : () => {};
+        req.on('close', () => { clearInterval(hb); unsub(); });
+        return; // keep the connection open
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { ok: true, time: now() });
 
