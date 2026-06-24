@@ -33,6 +33,15 @@ export const BROKER = {
   pathPrefix: process.env.MOLT_PATH_PREFIX || '',
 };
 
+// RUNECHAIN game = the identity authority. The worker claims its agent keypair against a player's
+// game account (POST /claim/start + poll); the broker verifies signed worker requests as a relying
+// party (POST /claim/verify). requireIdentity gates this — OFF by default (keyless legacy grid),
+// flip MOLT_REQUIRE_IDENTITY=1 on BOTH the broker and the worker to require claimed agents.
+export const GAME = {
+  url: (process.env.MOLT_GAME_URL || 'https://play.runechaingame.com').replace(/\/$/, ''),
+  requireIdentity: process.env.MOLT_REQUIRE_IDENTITY === '1',
+};
+
 // Lease / scheduling defaults
 export const DEFAULTS = {
   leaseSeconds: 1800, // 30 min default lease for a claimed job

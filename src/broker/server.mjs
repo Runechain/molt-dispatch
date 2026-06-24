@@ -7,7 +7,8 @@ import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { getDb, now, nextSeq, logEvent, parseRow, transaction } from './db.mjs';
 import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
-import { BROKER, DEFAULTS, PATHS, FUEL } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, FUEL, GAME } from '../shared/config.mjs';
+import { verifyAgentClaim } from './agent-verify.mjs';
 import { planObjective } from './planner.mjs';
 import { pickJob, workerOffersBedrock } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
@@ -130,6 +131,14 @@ function constrainWorkerId(raw, ownerId) {
 
 async function registerWorker(body) {
   const d = getDb();
+  // Identity: when the grid requires claimed agents, verify the signed agent credential with the
+  // game (relying-party). The bound game account becomes the worker's owner so reputation/stake
+  // accrue per ACCOUNT, not per keypair. Trust is still EARNED — verify-don't-trust still holds.
+  if (GAME.requireIdentity) {
+    const v = await verifyAgentClaim(body.agent, { now: now() });
+    if (!v.ok) return { ok: false, error: v.error };
+    body = { ...body, owner_id: 'acct:' + v.accountId };
+  }
   const id = body.worker_id ? constrainWorkerId(body.worker_id, body.owner_id) : mkWorkerId(body.owner_id || 'worker');
   const existing = d.prepare('SELECT id FROM workers WHERE id = ?').get(id);
   const manifest = body.manifest || { capabilities: body.capabilities, interfaces: body.interfaces };
@@ -698,7 +707,7 @@ export function startBroker() {
       }
 
       // API
-      if (method === 'POST' && path === '/workers/register') return json(res, 200, await registerWorker(body));
+      if (method === 'POST' && path === '/workers/register') { const r = await registerWorker(body); return json(res, r.ok === false ? 401 : 200, r); }
       if (method === 'POST' && path === '/workers/heartbeat') return json(res, 200, heartbeat(body));
       if (method === 'POST' && path === '/jobs/claim') {
         // Global concurrent-claim ceiling: a hard cap on simultaneous claim handling so a burst
