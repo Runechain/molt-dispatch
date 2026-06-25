@@ -24,8 +24,21 @@
         <span class="logo">▰▰▱</span>
         <h1>molt <span class="dim">· distributed agent compute grid</span></h1>
       </div>
-      <div class="status" id="broker-status"><span class="dot"></span> connecting…</div>
+      <div class="hdr-right">
+        <input id="op-key" type="password" placeholder="operator key — unlocks events" autocomplete="off" spellcheck="false" />
+        <div class="status" id="broker-status"><span class="dot"></span> connecting…</div>
+      </div>
     </header>
+    <script>
+      // Operator key field: persists to localStorage so the dashboard's fetches send it (app.js
+      // reads it). Paste your op1.… key to see the full authed view; leave blank for the public view.
+      (function () {
+        var el = document.getElementById('op-key');
+        if (!el) return;
+        el.value = localStorage.getItem('molt_op_key') || '';
+        el.addEventListener('change', function () { localStorage.setItem('molt_op_key', el.value.trim()); });
+      })();
+    </script>
 
     <main>
       <section class="col col-wide">
