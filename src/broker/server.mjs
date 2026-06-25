@@ -568,7 +568,14 @@ async function serveStatic(req, res, urlPath) {
   try {
     const s = await stat(filePath);
     if (!s.isFile()) throw new Error('not file');
-    const data = await readFile(filePath);
+    let data = await readFile(filePath);
+    // The CSP below forbids inline <script>, so the dashboard can't compute its own path prefix
+    // in-page. Inject a real <base> server-side instead (CSP allows <base>): relative assets
+    // (style.css, app.js) then resolve under the ALB prefix (/grid/dashboard), and app.js derives
+    // its API prefix from document.baseURI. Keeps the strict CSP intact — no inline-script hole.
+    if (extname(filePath) === '.html') {
+      data = Buffer.from(String(data).replace('<head>', `<head>\n    <base href="${BROKER.pathPrefix || ''}/dashboard/">`));
+    }
     res.writeHead(200, {
       'content-type': MIME[extname(filePath)] || 'application/octet-stream',
       // Lock the dashboard to same-origin assets: no inline/remote script injection vector.

@@ -4,18 +4,9 @@
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
     <title>molt · grid dispatch</title>
-    <script>
-      // The dashboard may be served behind a path prefix (e.g. /grid/dashboard on the deployed
-      // broker behind the ALB). Derive it from our own URL so the stylesheet, script, and every API
-      // call resolve correctly in BOTH local (/dashboard) and prod (/grid/dashboard).
-      (function () {
-        var prefix = location.pathname.replace(/\/dashboard\/?$/, '');
-        window.MOLT_PREFIX = prefix; // '' locally, '/grid' on prod
-        var base = document.createElement('base');
-        base.href = location.origin + prefix + '/dashboard/';
-        document.head.appendChild(base); // relative asset URLs below resolve against this
-      })();
-    </script>
+    <!-- The broker injects a base href server-side so the relative asset URLs below resolve under the
+         ALB path prefix (e.g. /grid/dashboard); no inline JS is used because the dashboard CSP is
+         strict (default-src self). app.js derives its API prefix from document.baseURI. -->
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
@@ -29,16 +20,6 @@
         <div class="status" id="broker-status"><span class="dot"></span> connecting…</div>
       </div>
     </header>
-    <script>
-      // Operator key field: persists to localStorage so the dashboard's fetches send it (app.js
-      // reads it). Paste your op1.… key to see the full authed view; leave blank for the public view.
-      (function () {
-        var el = document.getElementById('op-key');
-        if (!el) return;
-        el.value = localStorage.getItem('molt_op_key') || '';
-        el.addEventListener('change', function () { localStorage.setItem('molt_op_key', el.value.trim()); });
-      })();
-    </script>
 
     <main>
       <section class="col col-wide">
