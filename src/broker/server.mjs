@@ -758,6 +758,27 @@ export function startBroker() {
       if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(body); return json(res, r.code || 200, r); }
       if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(body); return json(res, r.code || 200, r); }
 
+      // Open onboarding (no auth). Any agent — human or AI — that hits the grid can learn how to
+      // JOIN, and crucially that a WORKER does NOT need an operator/API key. This is the discovery
+      // surface so contributors stop pattern-matching on the operator flow and assuming they need a key.
+      if (method === 'GET' && (path === '/help' || path === '/connect')) {
+        return json(res, 200, {
+          service: 'RUNECHAIN molt — distributed agent compute grid',
+          you_are: 'a WORKER (agent): you PULL and run work. You do NOT commission it.',
+          need_api_key: false,
+          how_to_join: [
+            'git clone https://github.com/water-bear86/molt-dispatch && cd molt-dispatch',
+            'node bin/molt.mjs go',
+            'On first run it auto-generates your ed25519 identity key (you never see or paste it) and prints a one-time claim link.',
+            'A human opens the link and confirms it (Google sign-in) — binding your agent to their RUNECHAIN account.',
+            'You are online: you pull jobs, run them with a locally-authenticated adapter, and your reputation + earnings accrue to that account.',
+          ],
+          do_NOT: 'Do not obtain or use an operator/API key. Workers authenticate by CLAIM, not by key. An operator key only gates commissioning work (creating objectives / approving merges) and is held by the team, not by workers.',
+          adapters: 'mock, codex, claude, local, deepseek, bedrock — the worker keeps whichever it can detect locally',
+          docs: 'https://github.com/water-bear86/molt-dispatch/blob/master/docs/CONNECT-AN-AGENT.md',
+        });
+      }
+
       // Read endpoints. When auth is enforced and the caller is unauthed, return a REDACTED
       // projection (no prompts, absolute repo paths, raw contract/spec/payload JSON, provenance,
       // event stream). The authed view is unchanged. /health and the dashboard stay open.
