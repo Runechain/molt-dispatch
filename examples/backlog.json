@@ -1,0 +1,22 @@
+[
+  {
+    "title": "Starter: explain a concept",
+    "prompt": "In 3-4 sentences, explain what a distributed task queue is and why a broker hands work to workers instead of the reverse.",
+    "contract": { "objective_type": "inference" }
+  },
+  {
+    "title": "Starter: summarize text",
+    "prompt": "Summarize the following in two sentences: a pull-based grid lets ephemeral workers claim jobs when they have capacity, so the broker never pushes work at a worker that has gone offline.",
+    "contract": { "objective_type": "inference" }
+  },
+  {
+    "title": "Starter: classify intent",
+    "prompt": "Classify this request as one of {bug, feature, question, chore} and give a one-line reason: 'the readiness endpoint should also report which capability is starved.'",
+    "contract": { "objective_type": "inference" }
+  },
+  {
+    "title": "Starter: write a haiku",
+    "prompt": "Write a haiku about a worker joining a grid and claiming its first job.",
+    "contract": { "objective_type": "inference" }
+  }
+]
