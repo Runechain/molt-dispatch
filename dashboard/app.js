@@ -7,8 +7,14 @@ const $ = (id) => document.getElementById(id);
 const PREFIX = String(window.MOLT_PREFIX || '').replace(/\/$/, '');
 const api = (path) => PREFIX + path;
 
+// Operator key (optional): paste it into the header field to unlock the FULL view — objectives and
+// the event stream are gated for anonymous viewers, so without a key you see only the public
+// (worker-list) projection. Stored in this browser's localStorage only; never sent anywhere but the broker.
+const opKey = () => (localStorage.getItem('molt_op_key') || '').trim();
+const authHeaders = () => { const k = opKey(); return k ? { authorization: 'Bearer ' + k } : {}; };
+
 async function getJSON(path) {
-  const res = await fetch(api(path));
+  const res = await fetch(api(path), { headers: authHeaders() });
   if (!res.ok) throw new Error(`${path} -> ${res.status}`);
   return res.json();
 }
@@ -59,7 +65,7 @@ async function renderObjectives() {
     btn.addEventListener('click', async () => {
       btn.disabled = true;
       btn.textContent = 'merging…';
-      const r = await fetch(api(`/objectives/${btn.dataset.approve}/approve`), { method: 'POST' }).then((x) => x.json());
+      const r = await fetch(api(`/objectives/${btn.dataset.approve}/approve`), { method: 'POST', headers: authHeaders() }).then((x) => x.json());
       if (r.error) {
         btn.textContent = '✗ ' + r.error;
       }

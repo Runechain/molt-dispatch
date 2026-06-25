@@ -37,6 +37,14 @@ header {
 h1 { font-size: 15px; font-weight: 600; margin: 0; }
 .dim { color: var(--dim); font-weight: 400; }
 
+.hdr-right { display: flex; align-items: center; gap: 14px; }
+#op-key {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line);
+  border-radius: 6px; padding: 5px 9px; font-size: 12px; width: 190px;
+  font-family: inherit; outline: none;
+}
+#op-key:focus { border-color: var(--accent); }
+#op-key::placeholder { color: var(--dim); }
 .status { color: var(--dim); display: flex; align-items: center; gap: 8px; font-size: 13px; }
 .status .dot { width: 8px; height: 8px; border-radius: 50%; background: var(--dim); }
 .status.ok .dot { background: var(--green); box-shadow: 0 0 8px var(--green); }
