@@ -2,16 +2,25 @@
 
 const $ = (id) => document.getElementById(id);
 
-// Path prefix the dashboard is served under ('' locally, '/grid' behind the prod ALB). Set by the
-// inline bootstrap in index.html from location.pathname; every broker call is prefixed with it.
-const PREFIX = String(window.MOLT_PREFIX || '').replace(/\/$/, '');
+// Path prefix the dashboard is served under ('' locally, '/grid' behind the prod ALB). Derived from
+// the <base> the broker injects (document.baseURI) — no inline script, so it's CSP-safe.
+const PREFIX = new URL(document.baseURI).pathname.replace(/\/dashboard\/?$/, '');
 const api = (path) => PREFIX + path;
 
-// Operator key (optional): paste it into the header field to unlock the FULL view — objectives and
-// the event stream are gated for anonymous viewers, so without a key you see only the public
-// (worker-list) projection. Stored in this browser's localStorage only; never sent anywhere but the broker.
+// Operator key (optional): the header field unlocks the FULL view — objectives + the event stream
+// are gated for anonymous viewers, so without a key you see only the public (worker-list) projection.
+// Stored in this browser's localStorage only; never sent anywhere but the broker.
 const opKey = () => (localStorage.getItem('molt_op_key') || '').trim();
 const authHeaders = () => { const k = opKey(); return k ? { authorization: 'Bearer ' + k } : {}; };
+
+// Wire the operator-key field here (moved out of an inline <script> for CSP). Pre-fill from storage,
+// save on change, and refresh immediately so pasting a key gives instant feedback (no button needed).
+(function initKeyField() {
+  const el = $('op-key');
+  if (!el) return;
+  el.value = opKey();
+  el.addEventListener('change', () => { localStorage.setItem('molt_op_key', el.value.trim()); refresh(); });
+})();
 
 async function getJSON(path) {
   const res = await fetch(api(path), { headers: authHeaders() });
