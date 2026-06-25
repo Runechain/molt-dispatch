@@ -49,6 +49,7 @@ export const DEFAULTS = {
   heartbeatSeconds: 10, // worker heartbeat cadence
   claimPollSeconds: 3, // worker poll cadence when idle
   leaseSweepSeconds: 15, // broker requeues expired leases this often
+  workerStaleSeconds: Number(process.env.MOLT_WORKER_STALE_SECONDS) || 30, // no heartbeat in this window => reported offline (3x heartbeat)
 };
 
 // Team-gating. Off by default so the local quick-start needs no key; deployed/team

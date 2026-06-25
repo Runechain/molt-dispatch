@@ -7,7 +7,9 @@ import { trustScore } from './reputation.mjs';
 import { getBalance, PRIMARY_ACCOUNT } from './fuel.mjs';
 import { objectivesWithUnsatisfiedDeps, objectivesOnHold } from './objective-deps.mjs';
 
-const ONLINE_MS = DEFAULTS.heartbeatSeconds * 1000 * 3; // treat a worker offline after 3 missed beats
+// Treat a worker offline once its heartbeat goes stale — the SAME threshold the roster
+// (listWorkers) and the readiness probe use, so "online" never means three different things.
+const ONLINE_MS = DEFAULTS.workerStaleSeconds * 1000;
 
 // Does a worker advertise the AWS Bedrock provider? (the funded continuation backstop)
 export function workerOffersBedrock(workerId) {

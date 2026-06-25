@@ -360,6 +360,28 @@ switch (cmd) {
     break;
   }
 
+  // Is the grid ready to DISTRIBUTE work, not just alive? Exit code is the alertable signal:
+  // 0 = ready, 2 = starved (pending work no live worker can claim), 1 = broker unreachable.
+  // Defaults to the prod broker like `molt logs`; pass your operator key for the full breakdown.
+  case 'readiness': {
+    process.env.MOLT_BROKER_URL = process.env.MOLT_BROKER_URL || 'https://play.runechaingame.com/grid';
+    const { flags } = parseFlags([sub, ...rest].filter(Boolean));
+    if (flags.key) process.env.MOLT_API_KEY = String(flags.key);
+    const r = await api('GET', '/readiness');
+    if (!r || r.ok !== true) { console.error('readiness check failed:', r?.error || r); process.exit(1); }
+    if (flags.json) { console.log(JSON.stringify(r, null, 2)); process.exit(r.ready ? 0 : 2); }
+    const mark = r.ready ? '\x1b[32mREADY\x1b[0m' : '\x1b[31mNOT READY\x1b[0m';
+    console.log(`${mark}  status=${r.status}`);
+    if (r.workers) console.log(`  workers: ${r.workers.online} online (${r.workers.idle} idle, ${r.workers.busy} busy)`);
+    if (r.jobs) console.log(`  jobs: ${r.jobs.pending_total} pending — ${r.jobs.claimable_now} claimable, ${r.jobs.saturated} waiting-on-capacity, ${r.jobs.starved} STARVED, ${r.jobs.blocked} blocked-on-deps`);
+    if (r.capability_gaps?.length) {
+      console.log('  capability gaps (pending work no online worker can do):');
+      for (const g of r.capability_gaps) console.log(`    - ${g.capability}: ${g.pending} job(s) waiting, 0 capable workers online`);
+    }
+    if (!r.workers) console.log('  (coarse view — gated broker; set MOLT_API_KEY for the full breakdown)');
+    process.exit(r.ready ? 0 : 2);
+  }
+
   case 'fuel': {
     const { flags, positional } = parseFlags(rest);
     const account = flags.account || 'acct_primary';
@@ -424,6 +446,7 @@ function usage() {
   molt approve <objective-id>        (github repo -> opens a PR; local repo -> merges)
   molt release <objective-id>        (clear an integration agent hold/escalation, re-gate)
   molt status [objective-id]
+  molt readiness [--key <operator-key>] [--json]   is the grid ready to DISTRIBUTE work? (exit 0 ready / 2 starved)
   molt dashboard
 
   env: MOLT_API_KEY (client auth), MOLT_OPENAI_BASE/MODEL (local provider), MOLT_BEDROCK_REGION/MODEL + AWS creds

@@ -15,7 +15,7 @@ import { onResult } from './lifecycle.mjs';
 import { reputationFor, recordEvent } from './reputation.mjs';
 import { buildResultCtx, approveObjective } from './broker-ops.mjs';
 import { listIssues } from './gh.mjs';
-import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor, clearObjectiveHold, clearNeedsReview, applyObjectiveGatingStatus } from './objective-deps.mjs';
+import { parseDependencyIssues, recordObjectiveDeps, resolveAndGate, unsatisfiedDepsFor, clearObjectiveHold, clearNeedsReview, applyObjectiveGatingStatus, objectivesWithUnsatisfiedDeps, objectivesOnHold } from './objective-deps.mjs';
 import { setIntegrationInfer } from './agents/integration-agent.mjs';
 import { setPlannerInfer } from './agents/planner-agent.mjs';
 import { importKey } from './keys.mjs';
@@ -498,10 +498,19 @@ function listJobs(objectiveId) {
   }));
 }
 function listWorkers() {
+  // Liveness is DERIVED from the heartbeat we already collect (every heartbeatSeconds), never from
+  // an outbound poll: the grid is pull-based, so an ephemeral worker that left simply stops
+  // heartbeating and drops off the roster ~workerStaleSeconds later. Mirror of how sweepLeases ages
+  // out a dead worker's jobs. The stored `status` column is just an internal cache (sweepWorkers
+  // keeps it roughly in sync for direct readers + the event stream) — the roster's truth is here.
+  const cutoff = now() - DEFAULTS.workerStaleSeconds * 1000;
   return getDb()
     .prepare('SELECT * FROM workers ORDER BY created_at ASC')
     .all()
-    .map((w) => ({ ...w, reputation: reputationFor(w.id) }));
+    .map((w) => {
+      const online = (w.last_heartbeat ?? 0) >= cutoff;
+      return { ...w, online, status: online ? 'online' : 'offline', reputation: reputationFor(w.id) };
+    });
 }
 function listEvents(limit = 100) {
   return getDb().prepare('SELECT * FROM events ORDER BY created_at DESC LIMIT ?').all(limit);
@@ -527,7 +536,8 @@ function redactFuelEntry(e) {
 }
 function redactWorker(w) {
   // Anonymous callers get coarse status only — never owner_id, the full manifest, or heartbeat ts.
-  return { id: w.id, status: w.status, trust_tier: w.trust_tier, active_slots: w.active_slots, max_slots: w.max_slots, reputation: w.reputation };
+  // `online`/`status` are heartbeat-derived (see listWorkers) so even the public roster is honest.
+  return { id: w.id, status: w.status, online: w.online, trust_tier: w.trust_tier, active_slots: w.active_slots, max_slots: w.max_slots, reputation: w.reputation };
 }
 
 // ---- Lease sweep: requeue jobs whose worker died (lease expired) --------------
@@ -552,6 +562,100 @@ export function sweepLeases() {
     refundFuel(PRIMARY_ACCOUNT, job.id);
     logEvent('job', job.id, 'lease_expired', { worker: job.assigned_worker_id, resumable: !!latestCheckpoint(job.id) });
   }
+}
+
+// ---- Worker sweep: age out workers whose heartbeat went stale -------------------
+// Passive liveness — we NEVER poll workers. Workers are ephemeral and may leave without notice
+// (a laptop closes, a process exits); the grid is pull-based, so a gone worker simply stops
+// claiming and no work is ever pushed at it. Here we let the heartbeat we already collect expire:
+// any 'online' worker we haven't heard from in workerStaleSeconds is flipped offline so the stored
+// status + event stream match the heartbeat-derived roster (see listWorkers). A returning worker's
+// next heartbeat/re-register flips it straight back online. Job/slot recovery is NOT done here —
+// sweepLeases owns that (requeue + slot refund + fuel refund) so we never double-handle a dropped
+// worker's in-flight job.
+export function sweepWorkers() {
+  const d = getDb();
+  const cutoff = now() - DEFAULTS.workerStaleSeconds * 1000;
+  const stale = d
+    .prepare(`SELECT id, last_heartbeat FROM workers WHERE status='online' AND (last_heartbeat IS NULL OR last_heartbeat < ?)`)
+    .all(cutoff);
+  for (const w of stale) {
+    d.prepare(`UPDATE workers SET status='offline' WHERE id=?`).run(w.id);
+    logEvent('worker', w.id, 'worker_offline', { last_heartbeat: w.last_heartbeat ?? null });
+  }
+}
+
+// ---- Readiness: can the grid actually distribute the work it is holding? --------
+// /health says the broker process is up. Readiness asks the harder question: is there pending work,
+// and can a LIVE worker claim it? The silent failure is STARVATION — pending, dependency-ready jobs
+// whose capability is advertised by ZERO online workers (or there are no online workers at all).
+// From the outside that looks identical to an empty queue, so we name it explicitly. "Online" uses
+// the SAME heartbeat-freshness threshold the scheduler uses to hand out jobs (workerStaleSeconds),
+// so this report never disagrees with what claim() would actually do. Blocked-on-dependency jobs are
+// counted separately — they are EXPECTED to wait and are not a readiness problem.
+export function readiness() {
+  const d = getDb();
+  const cutoff = now() - DEFAULTS.workerStaleSeconds * 1000;
+
+  const onlineWorkers = d
+    .prepare('SELECT manifest_json, active_slots, max_slots FROM workers WHERE last_heartbeat IS NOT NULL AND last_heartbeat >= ?')
+    .all(cutoff)
+    .map((w) => {
+      let caps = [];
+      try { caps = JSON.parse(w.manifest_json || '{}').capabilities || []; } catch { /* ignore */ }
+      return { caps, hasSlot: (w.active_slots ?? 0) < (w.max_slots ?? 1) };
+    });
+  const capsOnline = new Set(onlineWorkers.flatMap((w) => w.caps));
+  const capsWithSlot = new Set(onlineWorkers.filter((w) => w.hasSlot).flatMap((w) => w.caps));
+  // A job with no capability_required can be done by ANY worker — but only if one exists.
+  const anyOnline = onlineWorkers.length > 0;
+  const anyWithSlot = onlineWorkers.some((w) => w.hasSlot);
+  const someoneCanDo = (cap) => (cap ? capsOnline.has(cap) : anyOnline);
+  const someoneFreeCanDo = (cap) => (cap ? capsWithSlot.has(cap) : anyWithSlot);
+
+  const pending = d.prepare("SELECT id, objective_id, capability_required FROM jobs WHERE status='pending'").all();
+  const objBlocked = objectivesWithUnsatisfiedDeps();
+  const objHeld = objectivesOnHold();
+  const unmetDeps = d.prepare(
+    `SELECT COUNT(*) AS n FROM job_dependencies jd JOIN jobs j ON j.id = jd.depends_on_job_id WHERE jd.job_id = ? AND j.status != 'accepted'`
+  );
+
+  const jobs = { pending_total: pending.length, claimable_now: 0, saturated: 0, starved: 0, blocked: 0 };
+  const gaps = new Map(); // capability -> count of starved jobs
+  for (const job of pending) {
+    if (objBlocked.has(job.objective_id) || objHeld.has(job.objective_id) || unmetDeps.get(job.id).n > 0) {
+      jobs.blocked++;
+      continue;
+    }
+    const cap = job.capability_required;
+    if (!someoneCanDo(cap)) {
+      jobs.starved++;
+      const k = cap || '(none)';
+      gaps.set(k, (gaps.get(k) || 0) + 1);
+    } else if (!someoneFreeCanDo(cap)) {
+      jobs.saturated++; // a capable worker exists but none has a free slot right now
+    } else {
+      jobs.claimable_now++;
+    }
+  }
+
+  // Starvation is the only condition that means "not ready" — work is waiting and no live worker can
+  // take it. Saturation (capable but busy) and idle (nothing pending) are both fine resting states.
+  const status = jobs.starved > 0 ? 'starved' : jobs.claimable_now > 0 ? 'draining' : jobs.saturated > 0 ? 'saturated' : 'idle';
+
+  return {
+    ok: true,
+    ready: jobs.starved === 0,
+    status,
+    time: now(),
+    workers: {
+      online: onlineWorkers.length,
+      idle: onlineWorkers.filter((w) => w.hasSlot).length,
+      busy: onlineWorkers.filter((w) => !w.hasSlot).length,
+    },
+    jobs,
+    capability_gaps: [...gaps.entries()].map(([capability, pending]) => ({ capability, pending })),
+  };
 }
 
 // ---- Static dashboard serving ------------------------------------------------
@@ -824,6 +928,13 @@ export function startBroker() {
         return; // keep the connection open
       }
       if (method === 'GET' && path === '/health') return json(res, 200, { ok: true, time: now() });
+      if (method === 'GET' && path === '/readiness') {
+        // /health is liveness (open, for the ECS container check). /readiness is the work-distribution
+        // question and exposes backlog + capability detail, so on a gated broker anonymous callers get
+        // only the coarse verdict (ready/status) — same gating posture as /events.
+        const r = readiness();
+        return json(res, 200, authed ? r : { ok: r.ok, ready: r.ready, status: r.status, time: r.time });
+      }
 
       // Dashboard
       if (method === 'GET') return await serveStatic(req, res, path);
@@ -835,6 +946,7 @@ export function startBroker() {
   });
 
   setInterval(sweepLeases, DEFAULTS.leaseSweepSeconds * 1000).unref();
+  setInterval(sweepWorkers, DEFAULTS.leaseSweepSeconds * 1000).unref();
 
   server.listen(BROKER.port, BROKER.host, () => {
     console.log(`[broker] listening on ${BROKER.url}`);
