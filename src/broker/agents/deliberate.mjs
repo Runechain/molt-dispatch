@@ -92,6 +92,13 @@ async function runDag(runNode) {
 
 const clamp01 = (n) => (Number.isFinite(n) ? Math.max(0, Math.min(1, n)) : 0);
 
+// A panel identity tag for one deliberation run. When the cheap seats are distributed to the
+// grid (see grid-infer.mjs), this id + the per-seat node id let dispatched jobs be correlated
+// back to the panel that requested them — and back-pressure / cancellation can target a panel.
+// In-broker (makeProviderInfer) this is ignored, so plain-infer callers are wholly unaffected.
+// Self-contained on purpose (app-level Date.now/Math.random, no DB seq) — a panel is ephemeral.
+const newPanelId = () => `panel_${Date.now().toString(36)}_${Math.random().toString(36).slice(2, 8)}`;
+
 /**
  * Run the deliberation DAG and return a normalized verdict.
  * @param {object}   o
@@ -107,12 +114,19 @@ export async function deliberate({ question, context = {}, decisions, infer, log
   if (!Array.isArray(decisions) || !decisions.length) throw new Error('deliberate: decisions[] is required');
   const allowed = [...new Set([...decisions, 'escalate'])];
 
+  // One identity per deliberation run. Passed into every infer() call so a grid-distributing
+  // infer (grid-infer.mjs) can tag each dispatched cheap seat with { panelId, seatKey }; the
+  // in-broker infer (makeProviderInfer) simply ignores these fields — backward compatible.
+  const panelId = newPanelId();
+
   const usage = { cheapCalls: 0, premiumCalls: 0, tokens: 0 };
   const runNode = async (node, done) => {
     const system = node.role === 'judge' ? judgeSystem : SYSTEMS[node.role];
     const prompt = rolePrompt(node, question, context, done, allowed);
     log(`[deliberate] ${node.id} (${node.tier})`);
-    const res = await infer({ tier: node.tier, role: node.role, phase: node.phase, system, prompt });
+    // seatKey === node.id: runDag already topologically ordered this seat, so each cheap seat is
+    // an INDEPENDENT inference job — there are no inter-seat deps left for the grid to honor.
+    const res = await infer({ tier: node.tier, role: node.role, phase: node.phase, system, prompt, panelId, seatKey: node.id });
     if (node.tier === 'premium') usage.premiumCalls++;
     else usage.cheapCalls++;
     if (res?.usage?.tokens) usage.tokens += res.usage.tokens;

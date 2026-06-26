@@ -60,6 +60,28 @@ export const AUTH = {
   header: 'authorization',
 };
 
+// Join gate. When MOLT_JOIN_SECRET is set, EVERY worker registration must present a matching
+// join_token (constant-time checked) — independent of MOLT_OPEN_GRID, so open mode can't bypass it.
+// This is the real lock on "who can join": the public `molt go` flow is inert without this token,
+// which the operator issues out-of-band to invited nodes only. It layers ON TOP of identity-claim
+// (MOLT_REQUIRE_IDENTITY). Unset (null) = gate OFF — backward-compatible, existing flows unchanged.
+export const JOIN = {
+  // Lazy getter (like GAME) so a late env set (`molt go`) or a test toggle is honored, and the secret
+  // is never captured at import time.
+  get secret() { return process.env.MOLT_JOIN_SECRET || null; },
+};
+
+// Quorum / distributed deliberation. The deliberation panel (src/broker/agents/deliberate.mjs)
+// runs its CHEAP-tier debate seats (pessimist/optimist/realist opens+rebuts + skeptic) as plain
+// `inference` jobs on worker NODES, while the single PREMIUM judge stays house-held in-broker.
+// OFF by default — when off, the agents use the in-broker makeProviderInfer path verbatim and
+// there is ZERO behavior change (no seats are ever enqueued, the claimable filter never sees a
+// panel_id, every existing test/flow is byte-identical). Flip MOLT_QUORUM_GRID=1 to distribute.
+export const QUORUM = {
+  gridEnabled: process.env.MOLT_QUORUM_GRID === '1',      // off by default — zero behavior change
+  seatTimeoutMs: Number(process.env.MOLT_QUORUM_SEAT_TIMEOUT_MS || 8000),
+};
+
 // Fuel / budget. Real spend stays behind a flag + a hard cap.
 // Balance is denominated in USDC-cents (100 cents = $1.00).
 export const FUEL = {

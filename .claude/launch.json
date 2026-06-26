@@ -2,10 +2,10 @@
   "version": "0.0.1",
   "configurations": [
     {
-      "name": "molt-broker",
-      "runtimeExecutable": "node",
-      "runtimeArgs": ["bin/molt.mjs", "broker", "start"],
-      "port": 7077
+      "name": "molt-dashboard",
+      "runtimeExecutable": "/bin/sh",
+      "runtimeArgs": ["-c", "MOLT_DATA_DIR=/tmp/molt-demo-data MOLT_PORT=7099 exec node /Users/angusdurrie/molt-dispatch/bin/molt.mjs broker start"],
+      "port": 7099
     }
   ]
 }

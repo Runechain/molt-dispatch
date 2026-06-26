@@ -13,6 +13,7 @@
 
 import { deliberate } from './deliberate.mjs';
 import { getDb, now, logEvent } from '../db.mjs';
+import { cfg } from '../runtime-config.mjs';
 import {
   objectivesDependingOn,
   objectiveDepsSatisfied,
@@ -25,7 +26,8 @@ let INFER = null;
 
 // Bound premium fan-out: at most this many full debates per approval event; beyond it, remaining
 // dependents are held (and surfaced) for later re-evaluation rather than each spending a debate.
-const MAX_DELIBERATIONS = Number(process.env.MOLT_MAX_DELIBERATIONS || 8);
+// Read live via cfg('maxDeliberations') at call time (NOT a module-load const) so an operator can
+// retune the fan-out cap without restarting the broker; falls back to MOLT_MAX_DELIBERATIONS/env.
 
 // Wire a real inference function (cheap+premium tiers) at broker start. Left null => the broker
 // falls back to the deterministic floor (release-on-approve). See makeProviderInfer in deliberate.mjs.
@@ -72,6 +74,7 @@ const QUESTION =
 export async function integrateUpstreamApproved(upstreamId) {
   const results = [];
   let deliberations = 0;
+  const maxDeliberations = cfg('maxDeliberations'); // live-tunable fan-out cap, read per event
   for (const depId of objectivesDependingOn(upstreamId)) {
     // The floor still rules: if other upstreams aren't approved, the dependent isn't eligible yet.
     if (!objectiveDepsSatisfied(depId)) {
@@ -91,7 +94,7 @@ export async function integrateUpstreamApproved(upstreamId) {
     setObjectiveHold(depId);
 
     // Cost cap: beyond the fan-out limit, leave the dependent held + surfaced instead of debating.
-    if (deliberations >= MAX_DELIBERATIONS) {
+    if (deliberations >= maxDeliberations) {
       logEvent('objective', depId, 'integration_deferred', { upstream: upstreamId, reason: 'deliberation cap reached' });
       results.push({ dependent: depId, decision: 'hold', reason: 'deliberation cap reached — held for re-evaluation' });
       continue;

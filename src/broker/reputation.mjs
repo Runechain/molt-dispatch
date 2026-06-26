@@ -3,7 +3,9 @@
 
 import { getDb, now } from './db.mjs';
 
-const WEIGHTS = {
+// Exported so the worker's connect-time preflight can quote the REAL reputation cost of advertising
+// a capability backed by an unauthed tool (single source of truth — the warning can't drift).
+export const WEIGHTS = {
   accepted: +1,
   rejected: -1,
   rollback: -2,

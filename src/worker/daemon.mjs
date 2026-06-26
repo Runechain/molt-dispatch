@@ -10,10 +10,11 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
-import { BROKER, DEFAULTS, PATHS, AUTH, GAME } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, AUTH, GAME, JOIN } from '../shared/config.mjs';
 import { workerId as mkWorkerId } from '../shared/ids.mjs';
 import { loadOrCreateAgentKey, ensureClaimed } from './agent-identity.mjs';
 import { getAdapter, resolveAdapter, listAdapters, adapterMeta } from './adapters/index.mjs';
+import { preflightReport } from './preflight.mjs';
 
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 // Capped exponential backoff with jitter — so a fleet recovering from a shared outage doesn't
@@ -62,6 +63,20 @@ export async function startWorker(opts = {}) {
   }
 
   const capabilities = [...new Set(enabled.flatMap((n) => getAdapter(n).capabilities))];
+
+  // Connect-time preflight (WHITEPAPER §8): detect() only proves a tool is PRESENT, not authed. Run
+  // the DEEP auth/reachability probe now and print a doctor-style block, so the operator sees BEFORE
+  // we advertise — a tool that's installed-but-logged-out would otherwise claim jobs and fail them
+  // closed, each failure a `rejected` reputation hit. Default = warn-and-proceed (this runs headless
+  // under go-live.sh, so it must NEVER block by default). --strict turns the same findings into a
+  // hard refusal: if the preferred baseline is unmet OR any advertised capability is backed by an
+  // unauthed tool, we exit(1) instead of registering.
+  const { strictBlocked } = await preflightReport({ enabled, capabilities, strict: !!opts.strict });
+  if (strictBlocked) {
+    console.error('[worker] --strict preflight failed — not registering. Fix the above or drop the adapter.');
+    process.exit(1);
+  }
+
   const id = opts.workerId || mkWorkerId(opts.owner || hostname());
   const trustTier = opts.trustTier ?? Number(process.env.MOLT_TRUST ?? 4);
   const maxSlots = opts.maxSlots ?? 1;
@@ -89,12 +104,17 @@ export async function startWorker(opts = {}) {
     max_slots: maxSlots,
     manifest,
     agent: agentKey ? agentKey.buildAuth() : undefined, // fresh-signed each attempt (bounds replay)
+    join_token: JOIN.secret || undefined, // operator-issued invite; broker rejects registration without it when set
   });
 
   // Register the worker, retrying durably through every failure mode. Reusable so the heartbeat /
   // claim loops can re-register if the broker later forgets this worker. `interactive:true` allows
   // the one-time human claim prompt (startup only); re-registrations run silently.
   let claimedOnce = false;
+  // The most recent successful register response — kept so we can read the broker's grid-demand
+  // `coverage` block (added to /workers/register) after registration without changing register()'s
+  // return contract (callers only ever need the worker id).
+  let lastRegister = null;
   async function register({ interactive = false } = {}) {
     let attempt = 0, settling = false, staleWarned = false;
     for (;;) {
@@ -145,6 +165,7 @@ export async function startWorker(opts = {}) {
         await sleep(backoff(attempt++));
         continue;
       }
+      lastRegister = reg;
       return reg.worker_id || id;
     }
   }
@@ -152,6 +173,9 @@ export async function startWorker(opts = {}) {
   const myId = await register({ interactive: true });
   console.log(`[worker] ${myId} online — adapters: ${enabled.join(', ')}`);
   console.log(`[worker] capabilities: ${capabilities.join(', ')}`);
+  // Grid-demand coverage (broker contract, optional): which QUEUED capabilities this node can/can't
+  // serve right now. Consume it if present; degrade silently if the broker doesn't send it.
+  printCoverage(lastRegister?.coverage);
 
   let activeSlots = 0;
   let stopped = false;
@@ -320,6 +344,29 @@ function artifactsDirFor(job) {
   const dir = `${PATHS.artifacts}/${job.job_id}`;
   mkdirSync(dir, { recursive: true });
   return dir;
+}
+
+// Render the broker's grid-demand coverage block (optional contract):
+//   coverage: { worker_capabilities, pending_by_capability:{cap:count}, uncovered:[], covered:[] }
+// One line per pending capability, tagged covered / UNCOVERED, then a note if anything queued can't
+// be claimed by this node. Absent coverage → print nothing (the broker may be an older build).
+function printCoverage(coverage) {
+  if (!coverage || typeof coverage !== 'object') return;
+  const pending = coverage.pending_by_capability || {};
+  const covered = new Set(coverage.covered || []);
+  const caps = Object.keys(pending);
+  if (caps.length) {
+    const parts = caps.map((cap) => {
+      const n = pending[cap];
+      const tag = covered.has(cap) ? 'covered' : 'UNCOVERED — no local adapter';
+      return `${cap}×${n} (${tag})`;
+    });
+    console.log(`[worker] Grid demand: ${parts.join(', ')}`);
+  }
+  const uncovered = coverage.uncovered || [];
+  if (uncovered.length) {
+    console.log(`[worker] note: queued ${uncovered.join(', ')} job(s) won't be claimed by this node (no matching adapter).`);
+  }
 }
 
 // Submit a result durably: bounded by a timeout, retried with backoff on transient failure, and —

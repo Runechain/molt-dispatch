@@ -169,7 +169,9 @@ try {
   ok(/escapeHtml\(w\.active_slots\)/.test(src) && /escapeHtml\(w\.max_slots\)/.test(src), 'dashboard escapes w.active_slots / w.max_slots');
   ok(/escapeHtml\(w\.trust_tier\)/.test(src), 'dashboard escapes w.trust_tier');
   ok(/escapeHtml\(r\.capability\)/.test(src), 'dashboard escapes reputation capability');
-  ok(/escapeHtml\(j\.id\)/.test(src), 'dashboard escapes j.id');
+  // The slab aggregates jobs by capability and renders no individual job id; require escaping only
+  // IF a job id is ever interpolated (the no-raw-${j.id} guarantee below still holds unconditionally).
+  ok(/escapeHtml\(j\.id\)/.test(src) || !/\bj\.id\b/.test(src), 'dashboard escapes j.id where rendered');
   ok(/escapeHtml\(e\.event_type\)/.test(src) && /escapeHtml\(e\.entity_id\)/.test(src), 'dashboard escapes event fields');
   // badge() must escape its status before interpolation.
   ok(/function badge[\s\S]{0,160}escapeHtml/.test(src), 'badge() escapes the status value');

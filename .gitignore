@@ -7,6 +7,14 @@
 .molt-agent.json
 .molt-worker.pid
 
+# Join/onboarding runbooks — kept local-only so the public repo doesn't advertise how to join the
+# live grid (the join token, not these docs, is the real gate). Keep your local copies.
+/docs/CONNECT-AN-AGENT.md
+/docs/GO-LIVE.md
+
+# Local double-click launcher (machine-specific; not for the shared repo)
+/molt-dashboard.command
+
 # Isolated codex config home for grid runs (contains symlinked auth)
 /.codex-grid-home/
 

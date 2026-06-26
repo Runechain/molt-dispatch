@@ -6,7 +6,7 @@ import { getDb, now, logEvent, parseRow } from './db.mjs';
 import { validateResult } from './validator.mjs';
 import { recordEvent, trustScore } from './reputation.mjs';
 import { chargeFuel, refundFuel, estimateCost, PRIMARY_ACCOUNT } from './fuel.mjs';
-import { FUEL } from '../shared/config.mjs';
+import { cfg } from './runtime-config.mjs';
 import { onUpstreamFailed } from './objective-deps.mjs';
 
 const MAX_ATTEMPTS = 2; // retry-once, then reject (default_on_failure §12)
@@ -56,7 +56,9 @@ function acceptJob(job, result = {}) {
   // ~0.667 and let every fresh identity skip the hold. The hold keys off earned trust, never the
   // worker-controlled result.provider, so a low-rep worker can't bypass it by faking a provider.
   const rep = trustScore(job.assigned_worker_id, job.capability_required);
-  const lowTrust = rep < FUEL.repThreshold;
+  // Live-tunable: read the rep threshold via cfg() at decision time so an operator override takes
+  // effect on the very next result without a broker restart (falls back to FUEL.repThreshold/env).
+  const lowTrust = rep < cfg('repThreshold');
 
   setJobStatus(job.id, 'accepted');
   recordEvent(job.assigned_worker_id, job.capability_required, 'accepted', job.id, meta);

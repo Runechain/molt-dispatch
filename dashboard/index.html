@@ -3,35 +3,69 @@
   <head>
     <meta charset="utf-8" />
     <meta name="viewport" content="width=device-width, initial-scale=1" />
-    <title>molt · grid dispatch</title>
-    <!-- The broker injects a base href server-side so the relative asset URLs below resolve under the
-         ALB path prefix (e.g. /grid/dashboard); no inline JS is used because the dashboard CSP is
-         strict (default-src self). app.js derives its API prefix from document.baseURI. -->
+    <title>molt · admin slab</title>
+    <!-- The broker injects `<base href="${pathPrefix}/dashboard/">` right after <head> server-side, so
+         the relative asset URLs below resolve under the ALB path prefix (e.g. /grid/dashboard). Keep this
+         <head> structure and the relative hrefs intact. No inline JS — the dashboard CSP is strict
+         (default-src 'self'); app.js derives its API prefix from document.baseURI. -->
     <link rel="stylesheet" href="style.css" />
   </head>
   <body>
     <header>
       <div class="brand">
         <span class="logo">▰▰▱</span>
-        <h1>molt <span class="dim">· distributed agent compute grid</span></h1>
+        <h1>molt <span class="dim">· admin slab · distributed agent compute grid</span></h1>
       </div>
       <div class="hdr-right">
-        <input id="op-key" type="password" placeholder="operator key — unlocks events" autocomplete="off" spellcheck="false" />
+        <input id="op-key" type="password" placeholder="operator API key — Bearer id.secret" autocomplete="off" spellcheck="false" />
         <div class="status" id="broker-status"><span class="dot"></span> connecting…</div>
       </div>
     </header>
 
-    <main>
-      <section class="col col-wide">
-        <h2>Objectives</h2>
-        <div id="objectives" class="stack"></div>
+    <!-- Inline status line for POST results (apply config / 401 / restart-required). -->
+    <div id="toast" class="toast" hidden></div>
+
+    <main class="slab">
+      <!-- ===== MONITORING ===== -->
+      <section class="panel span-4" id="panel-summary">
+        <h2>Summary</h2>
+        <div id="summary" class="bignums"><div class="empty">…</div></div>
       </section>
 
-      <section class="col">
-        <h2>Workers</h2>
-        <div id="workers" class="stack"></div>
+      <section class="panel span-2" id="panel-readiness">
+        <h2>Readiness</h2>
+        <div id="readiness"><div class="empty">…</div></div>
+      </section>
 
-        <h2>Event feed</h2>
+      <section class="panel span-3" id="panel-queue">
+        <h2>Queue · demand by capability</h2>
+        <div id="queue" class="stack"><div class="empty">…</div></div>
+      </section>
+
+      <section class="panel span-3" id="panel-workers">
+        <h2>Workers</h2>
+        <div id="workers" class="stack"><div class="empty">…</div></div>
+      </section>
+
+      <section class="panel span-3" id="panel-delib">
+        <h2>Deliberations · quorum</h2>
+        <div id="deliberations" class="stack"><div class="empty">…</div></div>
+      </section>
+
+      <section class="panel span-3" id="panel-rep">
+        <h2>Reputation</h2>
+        <div id="reputation" class="stack"><div class="empty">…</div></div>
+      </section>
+
+      <!-- ===== CONTROL ===== -->
+      <section class="panel span-3" id="panel-config">
+        <h2>Control · runtime config</h2>
+        <div id="config" class="config"><div class="empty">…</div></div>
+      </section>
+
+      <!-- ===== LIVE LOG ===== -->
+      <section class="panel span-3" id="panel-events">
+        <h2>Event log <span id="ev-live" class="dim">· idle</span></h2>
         <div id="events" class="feed"></div>
       </section>
     </main>

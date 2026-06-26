@@ -2,7 +2,8 @@
 // WHITEPAPER §6. Here we run it job-side: given a claiming worker, pick its best job.
 
 import { getDb } from './db.mjs';
-import { DEFAULTS, FUEL } from '../shared/config.mjs';
+import { DEFAULTS } from '../shared/config.mjs';
+import { cfg } from './runtime-config.mjs'; // live-tunable knobs (minBalance) honor runtime overrides
 import { trustScore } from './reputation.mjs';
 import { getBalance, PRIMARY_ACCOUNT } from './fuel.mjs';
 import { objectivesWithUnsatisfiedDeps, objectivesOnHold } from './objective-deps.mjs';
@@ -53,6 +54,43 @@ function reviewImplAuthors(reviewJobId) {
     .filter(Boolean);
 }
 
+// Quorum independence: does this worker's OWNER already hold another seat on the same panel?
+// A panel is a single deliberate() run distributed across the grid; for the debate to be an
+// independent verdict (verify-don't-trust), one operator must not occupy two seats and double-vote
+// the panel. Identity is taken from the workers table (worker.id -> owner_id), never from the claim
+// body. "Holds a seat" = any seat job on this panel in a non-released state — claimed/running OR a
+// finished one (completed/accepted) — assigned to a worker owned by the same owner. This mirrors the
+// reviewer-independence precedent (validator.mjs ~105 / scheduler.mjs reviewImplAuthors): a claim is
+// refused when the claimant is not independent of the work it would take. We compare on owner_id when
+// the worker carries one, and fall back to worker id for owner-less (keyless legacy) workers so the
+// rule still bites in the single-account local grid.
+function ownerSeatsOnPanel(claimingWorkerId, panelId) {
+  const d = getDb();
+  // Resolve the claimant's owner (NULL for keyless legacy workers).
+  const me = d.prepare('SELECT owner_id FROM workers WHERE id=?').get(claimingWorkerId);
+  const myOwner = me?.owner_id || null;
+  // Every other seat on this panel that is currently HELD (assigned to some worker) in a
+  // claimed/completed/accepted state. 'pending' seats are unclaimed and so held by nobody.
+  const heldSeats = d
+    .prepare(
+      `SELECT j.assigned_worker_id AS w
+         FROM jobs j
+        WHERE j.panel_id = ?
+          AND j.assigned_worker_id IS NOT NULL
+          AND j.status IN ('claimed','running','completed','accepted')`
+    )
+    .all(panelId);
+  for (const seat of heldSeats) {
+    if (!seat.w) continue;
+    if (seat.w === claimingWorkerId) return true; // same worker already on the panel
+    if (myOwner) {
+      const owner = d.prepare('SELECT owner_id FROM workers WHERE id=?').get(seat.w)?.owner_id || null;
+      if (owner && owner === myOwner) return true; // same operator, different node
+    }
+  }
+  return false;
+}
+
 // A job is claimable when it's pending and every dependency has been ACCEPTED.
 export function claimableJobsFor(worker) {
   const d = getDb();
@@ -79,6 +117,9 @@ export function claimableJobsFor(worker) {
     if ((job.trust_required ?? 0) > trustScore(worker.id, job.capability_required)) continue;
     // HARD: reviewer independence — a worker may not review an implementation it authored.
     if (job.type === 'code.review' && reviewImplAuthors(job.id).includes(worker.id)) continue;
+    // HARD: quorum independence — a worker (and its owner) may hold AT MOST ONE seat per panel.
+    // Only seat jobs carry a panel_id; for every other job this is a no-op (the column is NULL).
+    if (job.panel_id && ownerSeatsOnPanel(worker.id, job.panel_id)) continue;
     // SOFT-as-HARD: don't re-hand a dropped job to the worker that dropped it IF someone
     // else can take it (continuation handoff). If it's the only option, let it through.
     if (job.last_failed_worker_id && job.last_failed_worker_id === worker.id && otherCapableWorkerOnline(job, worker.id)) {
@@ -86,7 +127,7 @@ export function claimableJobsFor(worker) {
     }
     // HARD: if the claiming worker uses Bedrock (a paid provider), the team account must have
     // sufficient balance. budget=0 => only free/local agents run. (PLAN Phase 2: burn->fuel.)
-    if (workerOffersBedrock(worker.id) && getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) {
+    if (workerOffersBedrock(worker.id) && getBalance(PRIMARY_ACCOUNT) < cfg('minBalance')) {
       continue;
     }
     // HARD: all dependencies accepted

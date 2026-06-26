@@ -38,6 +38,27 @@ function migrate(d) {
   // Fault tolerance: remember who dropped a job so continuation avoids re-handing it.
   addCol('jobs', 'last_failed_worker_id', 'last_failed_worker_id TEXT');
   addCol('jobs', 'checkpoint_seq', 'checkpoint_seq INTEGER DEFAULT 0');
+  // Quorum / distributed deliberation. A deliberate() run is a "panel" with a string panel_id;
+  // each distributed cheap-tier seat is a standalone `inference` job tagged with its panel_id and
+  // its seat_role (the DAG node id, e.g. 'rebut_realist'). Both are NULL for every non-seat job, so
+  // every existing row/flow is untouched. The columns drive (a) the claim-time independence rule —
+  // a worker may hold AT MOST ONE seat per panel — and (b) seat collection/debugging. There are NO
+  // inter-seat job_dependencies: the in-process runDag enforces DAG ordering, so the broker treats
+  // each seat as an independent inference job and panel_id exists ONLY for the independence rule.
+  addCol('jobs', 'panel_id', 'panel_id TEXT');
+  addCol('jobs', 'seat_role', 'seat_role TEXT');
+  // Runtime config overrides (admin panel). A flat key->value-as-TEXT store layered ON TOP of the
+  // MOLT_* env defaults: src/broker/runtime-config.mjs reads/writes it lazily, and cfg() honors a
+  // stored value for `live`-tier knobs without a restart. Created additively here so pre-existing
+  // databases pick it up on the next open; empty by default => every knob reads its env/boot value
+  // and behavior is byte-identical to before any override is set.
+  d.exec(`
+    CREATE TABLE IF NOT EXISTS runtime_config (
+      key TEXT PRIMARY KEY,
+      value TEXT,
+      updated_at INTEGER
+    );
+  `);
   // Ensure the primary team account exists for the fuel ledger.
   ensurePrimaryAccount(d);
   // Seed cost model with known Bedrock pricing (INSERT OR IGNORE).

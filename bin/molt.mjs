@@ -101,6 +101,9 @@ switch (cmd) {
         owner: flags.owner,
         maxSlots: flags['max-slots'] ? Number(flags['max-slots']) : undefined,
         trustTier: flags.trust != null ? Number(flags.trust) : undefined,
+        // --strict: refuse to register if the preferred baseline is unmet or a to-be-advertised
+        // capability is backed by an installed-but-unauthed tool. Default = warn-and-proceed.
+        strict: !!flags.strict,
       });
     } else usage();
     break;
@@ -128,6 +131,8 @@ switch (cmd) {
       adapters: flags.adapters ? String(flags.adapters).split(',').map((s) => s.trim()) : undefined,
       owner: flags.owner,
       maxSlots: flags['max-slots'] ? Number(flags['max-slots']) : undefined,
+      // --strict here too, though `molt go` is the headless join path — default stays non-blocking.
+      strict: !!flags.strict,
     });
     break;
   }
@@ -433,7 +438,7 @@ function usage() {
 
   molt doctor
   molt broker start                  (set MOLT_AUTH=1 to require API keys)
-  molt worker start [--adapters mock,codex,claude,local,bedrock] [--owner NAME] [--max-slots N] [--trust N]
+  molt worker start [--adapters mock,codex,claude,local,bedrock] [--owner NAME] [--max-slots N] [--trust N] [--strict]
   molt infer "<prompt>" [--title T] [--adapter local|bedrock]
   molt result <objective-id>         (print inference completions)
   molt objective create "<title>" [--prompt TEXT] [--repo PATH] [--base BRANCH] [--plan llm]

@@ -2,12 +2,12 @@
 // Zero-dep node:http. Endpoints follow §11; read endpoints feed the dashboard.
 
 import http from 'node:http';
-import { createHash } from 'node:crypto';
+import { createHash, timingSafeEqual } from 'node:crypto';
 import { readFile, stat } from 'node:fs/promises';
 import { extname, join, normalize } from 'node:path';
 import { getDb, now, nextSeq, logEvent, parseRow, transaction, subscribeEvents } from './db.mjs';
-import { objectiveId as mkObjectiveId, workerId as mkWorkerId, leaseToken, checkpointId } from '../shared/ids.mjs';
-import { BROKER, DEFAULTS, PATHS, FUEL, GAME } from '../shared/config.mjs';
+import { objectiveId as mkObjectiveId, workerId as mkWorkerId, jobId as mkJobId, leaseToken, checkpointId } from '../shared/ids.mjs';
+import { BROKER, DEFAULTS, PATHS, FUEL, GAME, QUORUM, JOIN } from '../shared/config.mjs';
 import { verifyAgentClaim } from './agent-verify.mjs';
 import { planObjective } from './planner.mjs';
 import { pickJob, workerOffersBedrock } from './scheduler.mjs';
@@ -23,6 +23,40 @@ import { makeProviderInfer } from './agents/deliberate.mjs';
 import { getAdapter } from '../worker/adapters/index.mjs';
 import { getBalance, creditFuel, fuelLog, reserveFuel, refundFuel, estimateJobCost, estimateCost, chargeFuel, PRIMARY_ACCOUNT, recordPayout } from './fuel.mjs';
 import { verifyPayment, settlePayment, buildPaymentRequirement, centsToMicro, extractPaymentHeader } from './payments/x402.mjs';
+// Admin control-plane modules (runtime-config.mjs + admin-queries.mjs) are built by a sibling
+// agent. We load them via the SAME guarded dynamic-import pattern this file already uses for
+// grid-infer.mjs (see maybeEnableAgents): a hard `import ... from './runtime-config.mjs'` would
+// crash the WHOLE broker at module-eval time if the file hasn't landed yet, taking every existing
+// route down with it. Instead we lazily import both at boot into these holders. Until the modules
+// exist the holders stay null and the /admin + /deliberations + /reputation routes return a 500
+// JSON (their defensive wrappers); the moment the sibling's files land, the routes activate with no
+// further change here. The PINNED contract these expose:
+//   runtime-config.mjs: getConfigSnapshot({authed}) -> [knob], setOverride(key,val,{authed}) -> {ok,...}
+//   admin-queries.mjs:  deliberationsView() -> [...], reputationView() -> [...], adminSummary() -> {...}
+let getConfigSnapshot = null;
+let setOverride = null;
+let cfgFn = null; // runtime-config cfg() — lets the premium budget gate honor a live minBalance override
+let deliberationsView = null;
+let reputationView = null;
+let adminSummary = null;
+async function loadAdminModules() {
+  try {
+    const cfg = await import('./runtime-config.mjs');
+    getConfigSnapshot = cfg.getConfigSnapshot || null;
+    setOverride = cfg.setOverride || null;
+    cfgFn = cfg.cfg || null;
+  } catch (e) {
+    console.log(`[broker] runtime-config.mjs unavailable (${e.message}); /admin/config inactive until it lands`);
+  }
+  try {
+    const aq = await import('./admin-queries.mjs');
+    deliberationsView = aq.deliberationsView || null;
+    reputationView = aq.reputationView || null;
+    adminSummary = aq.adminSummary || null;
+  } catch (e) {
+    console.log(`[broker] admin-queries.mjs unavailable (${e.message}); /admin/summary,/deliberations,/reputation inactive until it lands`);
+  }
+}
 
 const json = (res, code, body) => {
   res.writeHead(code, { 'content-type': 'application/json' });
@@ -129,8 +163,24 @@ function constrainWorkerId(raw, ownerId) {
   return mkWorkerId(ownerId || 'worker');
 }
 
+// Constant-time check of a presented join token against the configured join secret. False for any
+// non-string / length mismatch (timingSafeEqual requires equal-length buffers).
+function joinTokenOk(token) {
+  if (typeof token !== 'string' || !JOIN.secret) return false;
+  const a = Buffer.from(token);
+  const b = Buffer.from(JOIN.secret);
+  return a.length === b.length && timingSafeEqual(a, b);
+}
+
 async function registerWorker(body) {
   const d = getDb();
+  // Join gate (the real lock on "who can join"): when a join secret is configured, every registration
+  // must present a matching token — constant-time compared, enforced REGARDLESS of MOLT_OPEN_GRID so
+  // open mode can't bypass it. The public `molt go` flow is inert without this token, issued out-of-band
+  // to invited nodes only. Layers on top of the identity claim below.
+  if (JOIN.secret && !joinTokenOk(body && body.join_token)) {
+    return { ok: false, error: 'join_denied' };
+  }
   // Identity: when the grid requires claimed agents, verify the signed agent credential with the
   // game (relying-party). The bound game account becomes the worker's owner so reputation/stake
   // accrue per ACCOUNT, not per keypair. Trust is still EARNED — verify-don't-trust still holds.
@@ -155,7 +205,59 @@ async function registerWorker(body) {
     ).run(id, body.owner_id || null, 'online', now(), 0, JSON.stringify(manifest), 0, maxSlots, now());
   }
   logEvent('worker', id, 'registered', { capabilities: manifest.capabilities });
-  return { worker_id: id };
+  return { worker_id: id, coverage: gridDemandCoverage(manifest.capabilities) };
+}
+
+// ---- Grid-demand coverage ----------------------------------------------------
+// On registration the broker tells the worker whether its advertised capabilities actually cover
+// the work the grid currently has QUEUED (WHITEPAPER §5/§6: pull-based, capability-matched dispatch).
+// This is READ-ONLY reporting — it touches no scheduling/trust gate (verify-don't-trust unchanged);
+// it just lets a worker self-assess "is there work here I can do?" instead of polling claim blind.
+//
+// "Pending" = a job that is READY to be worked: status='pending' (so NOT blocked/claimed/completed/
+// accepted — claim() flips a taken job to 'claimed', so 'pending' already excludes assigned/running
+// work) AND every one of its job_dependencies has been ACCEPTED. That dependency gate mirrors the
+// scheduler's per-job HARD check in claimableJobsFor() (`deps.some(dep => dep.status !== 'accepted')`).
+// We intentionally do NOT apply the cross-objective dependency / integration-hold gate here: those are
+// per-worker/per-objective scheduling concerns and recomputing them would make registration heavier;
+// the dep-accepted approximation is the cheap, stable "what's claimable in principle" signal we want.
+function gridDemandCoverage(capabilities) {
+  // Resilience: registration must NEVER fail because coverage computation failed. Any DB/parse error
+  // yields a benign empty-but-well-shaped object rather than throwing out of registerWorker().
+  const advertised = Array.isArray(capabilities) ? capabilities : [];
+  try {
+    const d = getDb();
+    // SINGLE cheap grouped query: count ready jobs per required capability. NOT EXISTS finds jobs with
+    // any non-accepted dependency and excludes them (a job with zero dep rows trivially passes).
+    const rows = d
+      .prepare(
+        `SELECT capability_required AS cap, COUNT(*) AS n
+           FROM jobs
+          WHERE status = 'pending'
+            AND NOT EXISTS (
+              SELECT 1 FROM job_dependencies jd
+                JOIN jobs dep ON dep.id = jd.depends_on_job_id
+               WHERE jd.job_id = jobs.id AND dep.status != 'accepted'
+            )
+          GROUP BY capability_required`
+      )
+      .all();
+    const pending_by_capability = {};
+    for (const r of rows) {
+      // A job may have a NULL capability_required (any worker can take it). Bucket those under '*' so
+      // they still surface as demand without colliding with a real named capability.
+      const cap = r.cap || '*';
+      pending_by_capability[cap] = (pending_by_capability[cap] || 0) + r.n;
+    }
+    const adSet = new Set(advertised);
+    const demanded = Object.keys(pending_by_capability);
+    const covered = demanded.filter((cap) => adSet.has(cap));
+    const uncovered = demanded.filter((cap) => !adSet.has(cap));
+    return { worker_capabilities: advertised, pending_by_capability, uncovered, covered };
+  } catch {
+    // Partial-but-valid shape on failure — the consumer can rely on the fields always existing.
+    return { worker_capabilities: advertised, pending_by_capability: {}, uncovered: [], covered: [] };
+  }
 }
 
 function heartbeat(body) {
@@ -295,6 +397,106 @@ function latestCheckpoint(jobId) {
   }
 }
 
+// ---- Quorum: distributed deliberation seats ---------------------------------
+// A deliberate() run is a "panel". Its CHEAP-tier debate seats (pessimist/optimist/realist
+// opens+rebuts + the skeptic) are distributed to worker NODES as plain `inference` jobs; the
+// single PREMIUM judge is NEVER enqueued — it runs house-held in-broker. We IMPLEMENT two
+// injection-boundary functions the deliberation agent consumes via makeGridInfer:
+//   dispatchSeat(...) -> seatId   : enqueue one seat as an independent inference job
+//   collectSeat(...)  -> { text, usage } | null : await that seat's terminal result, or time out
+// There are deliberately NO inter-seat job_dependencies — the in-process runDag already enforces
+// DAG ordering (it only dispatches a seat after its deps' infer() calls resolve). panel_id exists
+// ONLY for the claim-time independence rule (one seat per panel per owner) + debugging.
+//
+// Seat read-back lives in this in-memory map, populated by submitResult when a seat completes. The
+// whole deliberation runs in THIS process (the broker), so an in-process map is the natural, lossless
+// channel for the seat's text+usage; the durable event log ('seat_result') is the audit copy. Entries
+// are consumed-and-deleted by collectSeat so the map can't grow unbounded across many panels.
+const seatResults = new Map();
+
+// Each panel needs an objective to hang its seat jobs on (jobs.objective_id is NOT NULL). Seats are
+// agent-internal deliberation, not domain work, so we lazily create one sentinel holder objective per
+// panel_id (status 'planning' so it never enters the merge/approve lifecycle) and reuse it for every
+// seat of that panel. Idempotent: a panel's holder is created once, on its first seat.
+function ensurePanelObjective(panelId) {
+  const d = getDb();
+  const existing = d.prepare("SELECT id FROM objectives WHERE id=?").get(panelHolderId(panelId));
+  if (existing) return existing.id;
+  const id = panelHolderId(panelId);
+  d.prepare(
+    `INSERT INTO objectives(id, title, prompt, repo, branch_base, contract_json, status, created_by, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?)
+     ON CONFLICT(id) DO NOTHING`
+  ).run(id, `quorum panel ${panelId}`, null, null, 'main', JSON.stringify({ objective_type: 'inference', quorum_panel: panelId }), 'planning', 'quorum', now(), now());
+  return id;
+}
+function panelHolderId(panelId) {
+  // Keep it inside the objectives id space but namespaced so it can never collide with O-## ids.
+  return `Q-${panelId}`;
+}
+
+// dispatchSeat — insert ONE cheap-tier seat as an independent `inference` job and return its id.
+// The prompt is assembled exactly as makeProviderInfer builds it (system ? system+"\n\n"+prompt :
+// prompt) so a worker runs the identical text whether the seat is local or distributed. The job is
+// born 'pending' (no dependencies — runDag gates ordering upstream) and tagged panel_id/seat_role.
+function dispatchSeat({ panelId, seatKey, role, phase, system, prompt }) {
+  const d = getDb();
+  const objectiveId = ensurePanelObjective(panelId);
+  const seatId = mkJobId(nextSeq('job'));
+  const combinedPrompt = system ? `${system}\n\n${prompt}` : prompt;
+  const ts = now();
+  d.prepare(
+    `INSERT INTO jobs(id, objective_id, job_key, type, title, prompt, capability_required,
+                      trust_required, adapter_hint, spec_json, status, priority,
+                      estimated_minutes, attempts, panel_id, seat_role, created_at, updated_at)
+     VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,0,?,?,?,?)`
+  ).run(
+    seatId,
+    objectiveId,
+    seatKey || role,
+    'inference',
+    `deliberation seat: ${role}/${phase}`,
+    combinedPrompt,
+    'inference',
+    0,
+    null,
+    JSON.stringify({}),
+    'pending',
+    100,
+    5,
+    panelId,
+    seatKey || `${phase}_${role}`,
+    ts,
+    ts
+  );
+  logEvent('job', seatId, 'seat_dispatched', { panel_id: panelId, seat_role: seatKey || `${phase}_${role}`, role, phase });
+  return seatId;
+}
+
+// collectSeat — await a dispatched seat reaching a TERMINAL completed state, returning its output
+// text + usage; return null on timeout. Implemented as a bounded poll over the job/result state:
+// submitResult marks the job 'completed' and populates seatResults; we poll for that entry. A seat
+// that is rejected/retried/failed (no terminal output) drains its timeout and returns null, which
+// the deliberation primitive treats as an empty seat (the panel still adjudicates / fails safe).
+async function collectSeat({ seatId, timeoutMs } = {}) {
+  const d = getDb();
+  const deadline = now() + (Number.isFinite(timeoutMs) ? timeoutMs : QUORUM.seatTimeoutMs);
+  const intervalMs = 50;
+  // eslint-disable-next-line no-constant-condition
+  while (true) {
+    if (seatResults.has(seatId)) {
+      const out = seatResults.get(seatId);
+      seatResults.delete(seatId); // consume-once so the map stays bounded
+      return out;
+    }
+    // Terminal-but-no-output (rejected/failed after retries): stop early, the seat produced nothing.
+    const row = d.prepare('SELECT status FROM jobs WHERE id=?').get(seatId);
+    if (row && (row.status === 'rejected' || row.status === 'failed')) return null;
+    if (now() >= deadline) return null;
+    await new Promise((r) => setTimeout(r, intervalMs));
+  }
+}
+
 async function submitResult(jobId, body) {
   const d = getDb();
   const job = d.prepare('SELECT * FROM jobs WHERE id=?').get(jobId);
@@ -314,6 +516,25 @@ async function submitResult(jobId, body) {
     d.prepare(
       `INSERT INTO artifacts(job_id, worker_id, kind, path, hash, created_at) VALUES(?,?,?,?,?,?)`
     ).run(jobId, job.assigned_worker_id, a.kind, a.path || null, a.hash || null, now());
+  }
+  // Quorum seat read-back: for a distributed deliberation seat (panel_id set) the in-broker
+  // collectSeat() needs the seat's OUTPUT TEXT + USAGE, which the artifacts table doesn't carry
+  // (it stores only path/hash). Persist them durably in the event log under 'seat_result' so a
+  // bounded poll can recover them after the seat reaches a terminal state. Scoped to seat jobs —
+  // non-seat results are unaffected (panel_id is NULL for every existing job). The usage shape
+  // mirrors makeProviderInfer's return ({ tokens? } plus the worker's tokens_in/out) so the
+  // deliberation usage accumulator reads it the same way it reads an in-process infer.
+  if (job.panel_id) {
+    const usage = body.usage || {};
+    seatResults.set(jobId, {
+      text: body.output != null ? String(body.output) : '',
+      usage: {
+        tokens: usage.tokens ?? (((usage.input_tokens ?? body.tokens_in ?? 0) + (usage.output_tokens ?? body.tokens_out ?? 0)) || undefined),
+        input_tokens: usage.input_tokens ?? body.tokens_in,
+        output_tokens: usage.output_tokens ?? body.tokens_out,
+      },
+    });
+    logEvent('job', jobId, 'seat_result', { panel_id: job.panel_id, seat_role: job.seat_role });
   }
   logEvent('job', jobId, 'result_submitted', { status: body.status });
 
@@ -729,7 +950,8 @@ export function requiresOperatorAuth(method, path) {
 // Opt-in agent wiring. Both agents share one provider-backed infer (cheap=local Qwen,
 // premium=Bedrock; override via MOLT_DELIB_CHEAP / MOLT_DELIB_PREMIUM). Off by default — the
 // broker runs the deterministic floor + template planner unless explicitly enabled.
-function maybeEnableAgents() {
+// async because, when the quorum grid is enabled, it dynamically imports the grid-infer wrapper.
+async function maybeEnableAgents() {
   const tierAdapters = {
     cheap: process.env.MOLT_DELIB_CHEAP || 'local',
     premium: process.env.MOLT_DELIB_PREMIUM || 'bedrock',
@@ -743,7 +965,7 @@ function maybeEnableAgents() {
   // without a budget gate. (Premium-on-Bedrock still fails safe to 'escalate' when the ledger is dry.)
   const premiumIsBedrock = tierAdapters.premium === 'bedrock';
   const budgetGate = premiumIsBedrock
-    ? () => { if (getBalance(PRIMARY_ACCOUNT) < FUEL.minBalance) throw new Error('insufficient fuel for premium agent call'); }
+    ? () => { if (getBalance(PRIMARY_ACCOUNT) < (cfgFn ? cfgFn('minBalance') : FUEL.minBalance)) throw new Error('insufficient fuel for premium agent call'); }
     : null;
   let meterSeq = 0;
   const meter = premiumIsBedrock
@@ -755,7 +977,32 @@ function maybeEnableAgents() {
       }
     : null;
   let infer = null;
-  const sharedInfer = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, tierModels, log: () => {}, budgetGate, meter }));
+  // The in-broker provider infer — cheap seats AND the premium judge all run in-process. This is
+  // TODAY's path and stays verbatim when QUORUM.gridEnabled is OFF (zero behavior change).
+  const localInferOf = () => (infer ||= makeProviderInfer({ getAdapter, tierAdapters, tierModels, log: () => {}, budgetGate, meter }));
+
+  // When MOLT_QUORUM_GRID=1, wrap that local infer with makeGridInfer (built by the sibling agent in
+  // ./agents/grid-infer.mjs). makeGridInfer distributes the CHEAP-tier seats as inference jobs via our
+  // dispatchSeat/collectSeat injection boundary while keeping the PREMIUM judge on localInfer. We load
+  // grid-infer.mjs DYNAMICALLY + guarded so the broker still boots if the file isn't present yet; once
+  // it exists, the wrapper activates automatically. On the OFF path this whole block is skipped and
+  // sharedInfer === localInfer, so the agents behave exactly as before.
+  let gridInfer = null;
+  if (QUORUM.gridEnabled) {
+    try {
+      const mod = await import('./agents/grid-infer.mjs');
+      const makeGridInfer = mod.makeGridInfer || mod.default;
+      if (typeof makeGridInfer === 'function') {
+        gridInfer = makeGridInfer({ localInfer: localInferOf(), dispatchSeat, collectSeat, seatTimeoutMs: QUORUM.seatTimeoutMs, log: () => {} });
+        console.log('[broker] quorum grid ON — cheap deliberation seats distributed to the grid (premium judge house-held)');
+      } else {
+        console.log('[broker] quorum grid requested but ./agents/grid-infer.mjs exports no makeGridInfer; falling back to in-broker deliberation');
+      }
+    } catch (e) {
+      console.log(`[broker] quorum grid requested but grid-infer.mjs unavailable (${e.message}); falling back to in-broker deliberation`);
+    }
+  }
+  const sharedInfer = () => gridInfer || localInferOf();
   const tag = (t) => `${tierAdapters[t]}${tierModels[t] ? ':' + tierModels[t] : ''}`;
   if (process.env.MOLT_INTEGRATION_AGENT === '1') {
     setIntegrationInfer(sharedInfer());
@@ -783,7 +1030,14 @@ function seedBootstrapKey() {
 export function startBroker() {
   getDb(); // bootstrap schema
   seedBootstrapKey();
-  maybeEnableAgents();
+  // Fire-and-forget: when the quorum grid is OFF this runs fully synchronously (no awaits hit), so
+  // wiring is in place before the server binds; when ON it awaits a dynamic import — guard the
+  // promise so a missing/broken grid-infer module can never crash boot with an unhandled rejection.
+  Promise.resolve(maybeEnableAgents()).catch((e) => console.log(`[broker] agent wiring error: ${e.message}`));
+  // Lazily wire the admin control-plane modules (runtime-config + admin-queries). Same fire-and-forget
+  // posture: if the sibling's files aren't present yet this resolves quietly and the /admin routes
+  // report "module not loaded" until they land; it can never crash boot.
+  Promise.resolve(loadAdminModules()).catch((e) => console.log(`[broker] admin module wiring error: ${e.message}`));
   const server = http.createServer(async (req, res) => {
     const url = new URL(req.url, `http://${BROKER.host}:${BROKER.port}`);
     const rawPath = url.pathname;
@@ -873,20 +1127,30 @@ export function startBroker() {
       // JOIN, and crucially that a WORKER does NOT need an operator/API key. This is the discovery
       // surface so contributors stop pattern-matching on the operator flow and assuming they need a key.
       if (method === 'GET' && (path === '/help' || path === '/connect')) {
+        // The join recipe is operator-only: an anonymous passerby hitting the live broker gets a terse,
+        // non-instructive reply. Authed operators get the full how-to so they can onboard invited nodes.
+        // The real lock is the join token (registerWorker rejects without it when MOLT_JOIN_SECRET is
+        // set); this endpoint gating is the obscurity layer that stops advertising the flow.
+        if (!authed) {
+          return json(res, 200, {
+            service: 'RUNECHAIN molt — distributed agent compute grid',
+            access: 'invite-only — joining requires a token issued by the operator. Contact the team for access.',
+          });
+        }
         return json(res, 200, {
           service: 'RUNECHAIN molt — distributed agent compute grid',
           you_are: 'a WORKER (agent): you PULL and run work. You do NOT commission it.',
           need_api_key: false,
+          join_token_required: !!JOIN.secret,
           how_to_join: [
-            'git clone https://github.com/water-bear86/molt-dispatch && cd molt-dispatch',
+            'Obtain a join token from the operator and set MOLT_JOIN_SECRET in your environment.',
             'node bin/molt.mjs go',
             'On first run it auto-generates your ed25519 identity key (you never see or paste it) and prints a one-time claim link.',
             'A human opens the link and confirms it (Google sign-in) — binding your agent to their RUNECHAIN account.',
             'You are online: you pull jobs, run them with a locally-authenticated adapter, and your reputation + earnings accrue to that account.',
           ],
-          do_NOT: 'Do not obtain or use an operator/API key. Workers authenticate by CLAIM, not by key. An operator key only gates commissioning work (creating objectives / approving merges) and is held by the team, not by workers.',
+          do_NOT: 'Do not obtain or use an operator/API key. Workers authenticate by CLAIM + join token, not by operator key.',
           adapters: 'mock, codex, claude, local, deepseek, bedrock — the worker keeps whichever it can detect locally',
-          docs: 'https://github.com/water-bear86/molt-dispatch/blob/master/docs/CONNECT-AN-AGENT.md',
         });
       }
 
@@ -934,6 +1198,55 @@ export function startBroker() {
         // only the coarse verdict (ready/status) — same gating posture as /events.
         const r = readiness();
         return json(res, 200, authed ? r : { ok: r.ok, ready: r.ready, status: r.status, time: r.time });
+      }
+
+      // Admin control plane. Runtime config + admin read-views feed the operator console. Every
+      // handler body is wrapped so a query/import error returns a 500 JSON, NEVER an unhandled throw
+      // that crashes the server (the outer try/catch also catches, but we keep these self-contained so
+      // one bad view can't take down an otherwise-healthy request). Redaction uses the SAME `authed`
+      // notion as /workers: danger knob values are redacted by getConfigSnapshot when !authed, and
+      // /reputation returns [] for anonymous callers (operator-only detail).
+      if (method === 'GET' && path === '/admin/config') {
+        // Read the runtime knob snapshot. getConfigSnapshot redacts `danger` values when !authed.
+        try {
+          if (!getConfigSnapshot) return json(res, 500, { error: 'admin config module not loaded' });
+          return json(res, 200, { knobs: getConfigSnapshot({ authed }) });
+        } catch (e) { return json(res, 500, { error: `config snapshot failed: ${e.message}` }); }
+      }
+      if (method === 'POST' && path === '/admin/config') {
+        // Setting an override is operator-only: refuse anonymous callers outright (defence in depth —
+        // setOverride also rejects unauthorized, but we never even attempt it without auth). On a gated
+        // broker requiresOperatorAuth already 401s any POST when unauthed; this guard makes the rule
+        // explicit and correct even when MOLT_AUTH is off but the caller is still considered !authed.
+        if (!authed) return json(res, 401, { error: 'unauthorized' });
+        try {
+          if (!setOverride) return json(res, 500, { error: 'admin config module not loaded' });
+          const r = setOverride(body.key, body.value, { authed });
+          return json(res, r.ok ? 200 : 400, r);
+        } catch (e) { return json(res, 500, { error: `set override failed: ${e.message}` }); }
+      }
+      if (method === 'GET' && path === '/admin/summary') {
+        // Aggregate operator dashboard summary (workers / queue-by-capability / fuel / readiness).
+        try {
+          if (!adminSummary) return json(res, 500, { error: 'admin queries module not loaded' });
+          return json(res, 200, adminSummary());
+        } catch (e) { return json(res, 500, { error: `admin summary failed: ${e.message}` }); }
+      }
+      if (method === 'GET' && path === '/deliberations') {
+        // Deliberation panels + their seats (quorum debate visibility). Open read-view.
+        try {
+          if (!deliberationsView) return json(res, 500, { error: 'admin queries module not loaded' });
+          return json(res, 200, deliberationsView());
+        } catch (e) { return json(res, 500, { error: `deliberations view failed: ${e.message}` }); }
+      }
+      if (method === 'GET' && path === '/reputation') {
+        // Per-worker capability reputation detail. Redact for anonymous callers like /workers:
+        // an unauthed caller on a gated broker gets [] rather than owner/trust/event detail.
+        try {
+          if (!authed) return json(res, 200, []);
+          if (!reputationView) return json(res, 500, { error: 'admin queries module not loaded' });
+          return json(res, 200, reputationView());
+        } catch (e) { return json(res, 500, { error: `reputation view failed: ${e.message}` }); }
       }
 
       // Dashboard
