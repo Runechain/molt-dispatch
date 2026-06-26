@@ -30,18 +30,28 @@ export function createKey({ name, scopes = 'dispatch,worker', accountId: acct } 
 // Seed a PROVIDED key (`<id>.<secret>`) — the deployed-broker bootstrap path. The cloud broker's
 // DB lives on EFS and WAL mode can't be written by a second host, so a key can't be minted from
 // outside; instead the operator supplies MOLT_BOOTSTRAP_KEY and the broker seeds it on its own
-// boot (single writer, safe). Idempotent: a no-op if the id already exists. Only the sha256 of
-// the secret is stored.
-export function importKey(rawKey, { name = 'bootstrap', scopes = 'dispatch,worker', accountId: acct } = {}) {
+// boot (single writer, safe). Only the sha256 of the secret is stored.
+//
+// `force` (used by seedBootstrapKey): if the id already exists with a DIFFERENT secret hash, UPDATE
+// it (and un-revoke). Without this, ROTATING the bootstrap key (same id, new secret) silently kept
+// the stale hash — locking the operator out of a key they actually set. Default stays idempotent.
+export function importKey(rawKey, { name = 'bootstrap', scopes = 'dispatch,worker', accountId: acct, force = false } = {}) {
   const dot = String(rawKey || '').indexOf('.');
   if (dot < 1) throw new Error('importKey: key must be "<id>.<secret>"');
   const id = rawKey.slice(0, dot);
   const secret = rawKey.slice(dot + 1);
   if (!id || !secret) throw new Error('importKey: empty id or secret');
   const d = getDb();
-  if (d.prepare('SELECT id FROM api_keys WHERE id=?').get(id)) return { id, seeded: false };
-  const account = acct || ensureAccount({ name, role: 'team' });
   const hash = createHash('sha256').update(secret).digest('hex');
+  const existing = d.prepare('SELECT id, hash FROM api_keys WHERE id=?').get(id);
+  if (existing) {
+    if (force && existing.hash !== hash) {
+      d.prepare('UPDATE api_keys SET hash=?, revoked=0 WHERE id=?').run(hash, id);
+      return { id, seeded: true, rotated: true };
+    }
+    return { id, seeded: false };
+  }
+  const account = acct || ensureAccount({ name, role: 'team' });
   d.prepare('INSERT INTO api_keys(id, account_id, hash, name, scopes, revoked, created_at) VALUES(?,?,?,?,?,0,?)').run(
     id, account, hash, name || null, scopes, now()
   );

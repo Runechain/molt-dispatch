@@ -1036,8 +1036,9 @@ function seedBootstrapKey() {
   const raw = process.env.MOLT_BOOTSTRAP_KEY;
   if (!raw) return;
   try {
-    const r = importKey(raw, { name: 'bootstrap' });
-    console.log(r.seeded ? `[broker] bootstrap API key seeded (id=${r.id})` : `[broker] bootstrap API key already present (id=${r.id})`);
+    const r = importKey(raw, { name: 'bootstrap', force: true }); // force: re-seed on rotation (else a stale hash locks the operator out)
+    console.log(r.rotated ? `[broker] bootstrap API key ROTATED to current MOLT_BOOTSTRAP_KEY (id=${r.id})`
+      : r.seeded ? `[broker] bootstrap API key seeded (id=${r.id})` : `[broker] bootstrap API key already present (id=${r.id})`);
   } catch (e) {
     console.log(`[broker] bootstrap key NOT seeded: ${e.message}`);
   }
