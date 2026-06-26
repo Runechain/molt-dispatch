@@ -326,3 +326,26 @@ export function clearOverride(key, { authed = false } = {}) {
     restartRequired: knob.mutability === 'restart',
   };
 }
+
+/**
+ * applyStoredOverrides() — boot-apply for RESTART-tier overrides. Called ONCE at broker startup
+ * (after the DB is open, before config getters / agents are read) so a restart actually picks up
+ * what an operator set in the panel. Without this, restart overrides are stored + shown as "pending"
+ * but never take effect — even on restart — because boot reads process.env, not the DB.
+ *
+ * setOverride persists the CANONICAL env form (bools as '1'/'0'), so we assign it to process.env
+ * verbatim; the lazy config getters (and the direct `process.env.MOLT_*` reads in server.mjs) then
+ * reflect it. LIVE overrides are handled by cfg() at call time; deploy/danger are never web-mutable
+ * so never stored. Returns the list of keys applied (for a boot log line).
+ */
+export function applyStoredOverrides() {
+  const applied = [];
+  for (const knob of KNOBS) {
+    if (knob.mutability !== 'restart') continue;
+    const raw = readOverrideRaw(knob.key);
+    if (raw === undefined) continue;
+    process.env[knob.envVar] = raw;
+    applied.push(knob.key);
+  }
+  return applied;
+}

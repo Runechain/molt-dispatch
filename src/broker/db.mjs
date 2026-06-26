@@ -47,6 +47,10 @@ function migrate(d) {
   // each seat as an independent inference job and panel_id exists ONLY for the independence rule.
   addCol('jobs', 'panel_id', 'panel_id TEXT');
   addCol('jobs', 'seat_role', 'seat_role TEXT');
+  // Per-node invites (src/broker/invites.mjs). Which invite a worker joined with — NULL for every
+  // worker that joined via the shared MOLT_JOIN_SECRET or an ungated grid, so pre-existing rows and
+  // every legacy register flow are untouched. Added additively so an old DB picks it up on next open.
+  addCol('workers', 'invite_id', 'invite_id TEXT');
   // Runtime config overrides (admin panel). A flat key->value-as-TEXT store layered ON TOP of the
   // MOLT_* env defaults: src/broker/runtime-config.mjs reads/writes it lazily, and cfg() honors a
   // stored value for `live`-tier knobs without a restart. Created additively here so pre-existing
@@ -245,6 +249,25 @@ function bootstrap(d) {
       last_used INTEGER,
       revoked INTEGER NOT NULL DEFAULT 0,
       created_at INTEGER NOT NULL
+    );
+
+    -- Per-node join invites (src/broker/invites.mjs). The shared MOLT_JOIN_SECRET is one global
+    -- token; an invite is a SINGLE-NODE (or bounded max_uses) credential the operator hands to one
+    -- invited node. Presented once to the holder as id.secret (id = inv_..., the public part);
+    -- only secret_hash = sha256(secret) is stored — the raw secret never persists and is unrecoverable.
+    -- verifyInvite does the constant-time compare (mirrors api_keys / authOk). uses counts redemptions;
+    -- max_uses NULL = unlimited. revoked=1 kills it. last_used_* are advisory audit fields.
+    CREATE TABLE IF NOT EXISTS invites (
+      id TEXT PRIMARY KEY,                 -- public part (inv_...), sent with the secret as id.secret
+      secret_hash TEXT NOT NULL,           -- sha256(secret); the raw secret is never stored
+      label TEXT,                          -- operator note, e.g. the node/operator name
+      max_uses INTEGER,                    -- NULL = unlimited; else redemptions allowed before exhausted
+      uses INTEGER NOT NULL DEFAULT 0,     -- redemptions so far (verifyInvite bumps this on success)
+      revoked INTEGER NOT NULL DEFAULT 0,
+      created_by TEXT,                     -- who minted it (operator/account id), advisory
+      created_at INTEGER NOT NULL,
+      last_used_at INTEGER,                -- advisory audit: last successful redemption time
+      last_used_by TEXT                    -- advisory audit: worker id of last successful redemption
     );
 
     -- Fuel ledger: every reserve/charge/refund/credit/payout in one append-only log.

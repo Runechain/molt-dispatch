@@ -9,6 +9,8 @@ import { getDb, now, nextSeq, logEvent, parseRow, transaction, subscribeEvents }
 import { objectiveId as mkObjectiveId, workerId as mkWorkerId, jobId as mkJobId, leaseToken, checkpointId } from '../shared/ids.mjs';
 import { BROKER, DEFAULTS, PATHS, FUEL, GAME, QUORUM, JOIN } from '../shared/config.mjs';
 import { verifyAgentClaim } from './agent-verify.mjs';
+import { createInvite, listInvites, revokeInvite, verifyInvite } from './invites.mjs';
+import { applyStoredOverrides } from './runtime-config.mjs'; // boot-apply persisted restart overrides
 import { planObjective } from './planner.mjs';
 import { pickJob, workerOffersBedrock } from './scheduler.mjs';
 import { onResult } from './lifecycle.mjs';
@@ -174,12 +176,22 @@ function joinTokenOk(token) {
 
 async function registerWorker(body) {
   const d = getDb();
-  // Join gate (the real lock on "who can join"): when a join secret is configured, every registration
-  // must present a matching token — constant-time compared, enforced REGARDLESS of MOLT_OPEN_GRID so
-  // open mode can't bypass it. The public `molt go` flow is inert without this token, issued out-of-band
-  // to invited nodes only. Layers on top of the identity claim below.
-  if (JOIN.secret && !joinTokenOk(body && body.join_token)) {
-    return { ok: false, error: 'join_denied' };
+  // Join gate (the real lock on "who can join"): the gate is ON when a shared secret is configured OR
+  // invite-only mode is enabled. A registration passes by presenting EITHER a matching shared token
+  // (constant-time compared) OR a valid per-node invite token (single/multi-use, recorded on success).
+  // Enforced REGARDLESS of MOLT_OPEN_GRID so open mode can't bypass it; the public `molt go` flow is
+  // inert without a credential. Layers on top of the identity claim below. A valid invite's id is
+  // remembered so we can attribute the worker to it after the row is upserted.
+  const gateOn = !!JOIN.secret || JOIN.requireInvite;
+  let inviteId = null;
+  if (gateOn) {
+    const tok = body && body.join_token;
+    if (JOIN.secret && joinTokenOk(tok)) { /* shared secret accepted */ }
+    else {
+      const v = verifyInvite(tok, { workerId: body && body.worker_id });
+      if (!v.ok) return { ok: false, error: 'join_denied' };
+      inviteId = v.inviteId;
+    }
   }
   // Identity: when the grid requires claimed agents, verify the signed agent credential with the
   // game (relying-party). The bound game account becomes the worker's owner so reputation/stake
@@ -204,6 +216,10 @@ async function registerWorker(body) {
        VALUES(?,?,?,?,?,?,?,?,?)`
     ).run(id, body.owner_id || null, 'online', now(), 0, JSON.stringify(manifest), 0, maxSlots, now());
   }
+  // Attribute the worker to the invite it joined under (per-node provenance). Only set when an invite —
+  // not the shared secret — admitted this registration. The workers.invite_id column is added by the
+  // invites module's migration.
+  if (inviteId) d.prepare('UPDATE workers SET invite_id=? WHERE id=?').run(inviteId, id);
   logEvent('worker', id, 'registered', { capabilities: manifest.capabilities });
   return { worker_id: id, coverage: gridDemandCoverage(manifest.capabilities) };
 }
@@ -1030,6 +1046,13 @@ function seedBootstrapKey() {
 export function startBroker() {
   getDb(); // bootstrap schema
   seedBootstrapKey();
+  // Boot-apply persisted restart-tier overrides into process.env BEFORE the agents read env, so a
+  // restart actually applies what the operator set in the panel (otherwise restart knobs stay
+  // 'pending' forever). Synchronous + ahead of maybeEnableAgents.
+  try {
+    const applied = applyStoredOverrides();
+    if (applied.length) console.log(`[broker] applied stored restart override(s): ${applied.join(', ')}`);
+  } catch (e) { console.log(`[broker] applyStoredOverrides error: ${e.message}`); }
   // Fire-and-forget: when the quorum grid is OFF this runs fully synchronously (no awaits hit), so
   // wiring is in place before the server binds; when ON it awaits a dynamic import — guard the
   // promise so a missing/broken grid-infer module can never crash boot with an unhandled rejection.
@@ -1225,6 +1248,16 @@ export function startBroker() {
           return json(res, r.ok ? 200 : 400, r);
         } catch (e) { return json(res, 500, { error: `set override failed: ${e.message}` }); }
       }
+      if (method === 'POST' && path === '/admin/restart') {
+        // Operator-only: exit the process to apply PENDING restart-tier overrides. On ECS the service
+        // replaces the task (which boots via applyStoredOverrides); locally a supervisor restarts it.
+        // Respond 200 FIRST, then exit a beat later so the client receives the ack before the socket drops.
+        if (!authed) return json(res, 401, { error: 'unauthorized' });
+        json(res, 200, { ok: true, restarting: true });
+        console.log('[broker] operator-requested restart — exiting to apply pending restart overrides');
+        setTimeout(() => process.exit(0), 250);
+        return;
+      }
       if (method === 'GET' && path === '/admin/summary') {
         // Aggregate operator dashboard summary (workers / queue-by-capability / fuel / readiness).
         try {
@@ -1247,6 +1280,33 @@ export function startBroker() {
           if (!reputationView) return json(res, 500, { error: 'admin queries module not loaded' });
           return json(res, 200, reputationView());
         } catch (e) { return json(res, 500, { error: `reputation view failed: ${e.message}` }); }
+      }
+
+      // Per-node invites. Same defensive posture as the other /admin routes: each handler body is
+      // wrapped so a thrown error returns 500 JSON rather than crashing the server. Mutating routes
+      // (create/revoke) are operator-only; the list mirrors /reputation (operator-only detail, [] anon).
+      if (method === 'POST' && path === '/admin/invites') {
+        // Mint a new invite — returns the one-time token (shown ONCE). Operator-only.
+        if (!authed) return json(res, 401, { error: 'unauthorized' });
+        try {
+          const r = createInvite({ label: body.label ?? null, maxUses: body.max_uses ?? null, createdBy: 'operator' });
+          return json(res, 200, r);
+        } catch (e) { return json(res, 500, { error: `create invite failed: ${e.message}` }); }
+      }
+      if (method === 'GET' && path === '/admin/invites') {
+        // List invites (uses/limits/revocation status). Operator-only detail; [] for anonymous callers.
+        try {
+          return json(res, 200, authed ? listInvites() : []);
+        } catch (e) { return json(res, 500, { error: `list invites failed: ${e.message}` }); }
+      }
+      const revokeInviteMatch = path.match(/^\/admin\/invites\/([^/]+)\/revoke$/);
+      if (method === 'POST' && revokeInviteMatch) {
+        // Revoke an invite by id so it can no longer admit nodes. Operator-only.
+        if (!authed) return json(res, 401, { error: 'unauthorized' });
+        try {
+          const r = revokeInvite(revokeInviteMatch[1]);
+          return json(res, r.ok ? 200 : 404, r);
+        } catch (e) { return json(res, 500, { error: `revoke invite failed: ${e.message}` }); }
       }
 
       // Dashboard

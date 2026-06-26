@@ -195,6 +195,31 @@ h1 { font-size: 14px; font-weight: 600; margin: 0; }
 .seat.judge .role { color: var(--purple); }
 .house-note { color: var(--purple); font-size: 10px; margin-top: 6px; }
 
+/* ---- control: restart bar ---- */
+/* Sits between the panel <h2> and the knob list. The restart button is quiet when nothing is pending;
+   the amber pending notice appears (left of the button) when restart-tier overrides await a restart. */
+.restart-bar {
+  display: flex; align-items: center; gap: 10px; flex-wrap: wrap;
+  margin: 0 0 12px;
+}
+.restart-pending {
+  flex: 1 1 auto; min-width: 0;
+  color: var(--amber); font-size: 11px; font-weight: 600;
+  border: 1px solid #4a3a14; background: #1e1a0c;
+  border-radius: 8px; padding: 6px 10px;
+}
+.restart-btn {
+  margin-left: auto; flex: none;
+  background: var(--panel-3); color: var(--amber); border: 1px solid #4a3a14;
+  border-radius: 6px; padding: 5px 13px; cursor: pointer; font: inherit; font-size: 12px;
+  white-space: nowrap;
+}
+.restart-btn:hover { background: #1e1a0c; }
+.restart-btn:disabled { opacity: 0.5; cursor: default; }
+/* armed (first click of the two-click confirm): louder, red-leaning to signal "this drops the broker" */
+.restart-btn.armed { color: var(--red); border-color: #4a2121; background: #1e0f0f; }
+.restart-btn.armed:hover { background: #220f0f; }
+
 /* ---- control: config knobs ---- */
 .config { display: flex; flex-direction: column; gap: 14px; }
 .cfg-group .gname {
@@ -302,6 +327,80 @@ h1 { font-size: 14px; font-weight: 600; margin: 0; }
 .src-env { color: var(--amber); border-color: #4a3a14; }
 .src-default { color: var(--dim-2); }
 .pending-override { color: var(--amber); font-size: 10px; }
+
+/* ---- invites: node onboarding ---- */
+.invite-form { display: flex; gap: 8px; flex-wrap: wrap; margin-bottom: 10px; }
+.inv-input {
+  background: var(--bg); color: var(--fg); border: 1px solid var(--line-2);
+  border-radius: 6px; padding: 5px 9px; font: inherit; font-size: 12px; outline: none;
+}
+.inv-input:focus { border-color: var(--accent); }
+.inv-input::placeholder { color: var(--dim-2); }
+#inv-label { flex: 1 1 160px; min-width: 0; }
+.inv-max { width: 120px; flex: none; }
+.inv-issue {
+  background: #143018; color: var(--green); border: 1px solid #214a30;
+  border-radius: 6px; padding: 5px 13px; cursor: pointer; font: inherit; font-size: 12px; flex: none;
+}
+.inv-issue:hover { background: #1a3d20; }
+.inv-issue:disabled { opacity: 0.5; cursor: default; }
+
+/* invite list rows */
+.invite {
+  background: var(--panel-2); border: 1px solid var(--line);
+  border-radius: 8px; padding: 8px 11px;
+}
+.invite.revoked { opacity: 0.6; border-style: dashed; }
+.inv-head { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.inv-head .inv-label { font-weight: 600; flex: 1; min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.invite.revoked .inv-label { text-decoration: line-through; color: var(--dim); }
+.inv-uses { font-weight: 700; font-size: 12px; min-width: 40px; text-align: right; color: var(--accent); }
+.invite.revoked .inv-uses { color: var(--dim); }
+.inv-badge {
+  font-size: 10px; padding: 2px 8px; border-radius: 999px; text-transform: lowercase; white-space: nowrap;
+}
+.inv-badge.revoked { color: var(--red); border: 1px solid #4a2121; background: #1e0f0f; }
+.inv-badge.exhausted { color: var(--amber); border: 1px solid #4a3a14; background: #1e1a0c; }
+.inv-revoke {
+  background: #170d0d; color: var(--red); border: 1px solid #4a2121;
+  border-radius: 6px; padding: 3px 10px; cursor: pointer; font: inherit; font-size: 11px; flex: none;
+}
+.inv-revoke:hover { background: #220f0f; }
+.inv-revoke:disabled { opacity: 0.5; cursor: default; }
+.inv-meta { color: var(--dim); font-size: 11px; margin-top: 4px; display: flex; flex-wrap: wrap; gap: 4px 12px; }
+.inv-meta .inv-id { color: var(--dim-2); font-family: inherit; }
+
+/* one-time token reveal — a secret the operator must copy NOW. Made to stand out. */
+.invite-reveal {
+  border: 1px solid var(--amber); border-radius: 8px;
+  background: linear-gradient(180deg, #1e1a0c, #15130a);
+  padding: 11px 12px; margin-bottom: 12px;
+  box-shadow: 0 0 0 1px #4a3a14, 0 6px 22px rgba(0, 0, 0, 0.5);
+}
+.reveal-warn {
+  color: var(--amber); font-size: 12px; font-weight: 700;
+  text-transform: uppercase; letter-spacing: 0.4px; margin-bottom: 8px;
+}
+.reveal-row { display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+.reveal-token {
+  flex: 1 1 200px; min-width: 0;
+  background: var(--bg); color: var(--cyan); border: 1px solid var(--line-2);
+  border-radius: 6px; padding: 7px 10px; font-family: inherit; font-size: 13px;
+  word-break: break-all; user-select: all; -webkit-user-select: all;
+}
+.reveal-copy {
+  background: #143018; color: var(--green); border: 1px solid #214a30;
+  border-radius: 6px; padding: 7px 13px; cursor: pointer; font: inherit; font-size: 12px; flex: none;
+}
+.reveal-copy:hover { background: #1a3d20; }
+.reveal-dismiss {
+  background: transparent; color: var(--dim); border: 1px solid var(--line-2);
+  border-radius: 6px; padding: 7px 10px; cursor: pointer; font: inherit; font-size: 12px; flex: none; line-height: 1;
+}
+.reveal-dismiss:hover { color: var(--fg); border-color: var(--line); }
+.reveal-sub { color: var(--dim); font-size: 11px; margin-top: 7px; }
+.reveal-sub span { color: var(--dim-2); }
+.reveal-sub code { color: var(--cyan); }
 
 /* ---- event feed ---- */
 .feed { display: flex; flex-direction: column; gap: 1px; max-height: 360px; overflow-y: auto; font-size: 11px; }

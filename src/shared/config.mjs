@@ -69,6 +69,11 @@ export const JOIN = {
   // Lazy getter (like GAME) so a late env set (`molt go`) or a test toggle is honored, and the secret
   // is never captured at import time.
   get secret() { return process.env.MOLT_JOIN_SECRET || null; },
+  // Per-node invites (src/broker/invites.mjs) are a second join credential alongside the shared
+  // secret. The join gate is "on" when `JOIN.secret || JOIN.requireInvite`: setting this flag lets an
+  // operator run an invite-ONLY grid (no shared secret) and still force every registration through a
+  // valid per-node invite. OFF by default (false) — backward-compatible, existing flows unchanged.
+  get requireInvite() { return process.env.MOLT_REQUIRE_INVITE === '1'; },
 };
 
 // Quorum / distributed deliberation. The deliberation panel (src/broker/agents/deliberate.mjs)
@@ -78,8 +83,10 @@ export const JOIN = {
 // there is ZERO behavior change (no seats are ever enqueued, the claimable filter never sees a
 // panel_id, every existing test/flow is byte-identical). Flip MOLT_QUORUM_GRID=1 to distribute.
 export const QUORUM = {
-  gridEnabled: process.env.MOLT_QUORUM_GRID === '1',      // off by default — zero behavior change
-  seatTimeoutMs: Number(process.env.MOLT_QUORUM_SEAT_TIMEOUT_MS || 8000),
+  // Lazy getters so a boot-applied restart override (applyStoredOverrides sets process.env before the
+  // agents read it) and late env sets are honored — not captured at import. OFF by default.
+  get gridEnabled() { return process.env.MOLT_QUORUM_GRID === '1'; },
+  get seatTimeoutMs() { return Number(process.env.MOLT_QUORUM_SEAT_TIMEOUT_MS || 8000); },
 };
 
 // Fuel / budget. Real spend stays behind a flag + a hard cap.

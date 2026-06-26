@@ -300,6 +300,14 @@ async function renderReputation() {
 async function renderConfig() {
   const data = await getJSON('/admin/config'); // { knobs: [...] }
   const knobs = data.knobs || [];
+
+  // Pending restart-tier changes: knobs whose override is stored but only applies on restart
+  // (mutability==='restart' && pendingOverride != null). Recomputed every render so the restart-bar
+  // notice tracks live as the operator applies/clears restart knobs. pendingCount is a number we
+  // compute (not server text), so it's safe to interpolate without escaping.
+  const pendingCount = knobs.filter((k) => k.mutability === 'restart' && k.pendingOverride != null).length;
+  updateRestartPending(pendingCount);
+
   const el = $('config');
   if (!knobs.length) { el.innerHTML = `<div class="empty">no config knobs</div>`; return; }
 
@@ -367,6 +375,83 @@ function applyHowtoState(scope, key) {
 function markOpenHowtos(scope) {
   for (const key of openHowtos) applyHowtoState(scope, key);
 }
+
+// ---- Restart broker ---------------------------------------------------------
+// Restart-tier knobs (🟡) store an override that only takes effect when the broker re-reads env on
+// boot. POST /admin/restart (operator-only) exits the process; on ECS the service replaces the task,
+// which boots with applyStoredOverrides. updateRestartPending() reflects how many such overrides are
+// stored-but-not-applied (computed in renderConfig) into the amber notice beside the button.
+function updateRestartPending(pendingCount) {
+  const el = $('restart-pending');
+  if (!el) return;
+  if (pendingCount > 0) {
+    // pendingCount is a locally-computed integer, not server text — safe to interpolate.
+    el.textContent = `⟳ ${pendingCount} change${pendingCount === 1 ? '' : 's'} pending — restart to apply`;
+    el.hidden = false;
+  } else {
+    el.textContent = '';
+    el.hidden = true;
+  }
+}
+
+// Two-click confirm (lighter than a modal confirm()): first click arms the button ("Confirm?"), a
+// second click within the window actually POSTs. Auto-disarms after a few seconds so a stray first
+// click can't leave it primed.
+let restartArmed = false;
+let restartArmTimer = null;
+function disarmRestart(btn) {
+  restartArmed = false;
+  if (restartArmTimer) { clearTimeout(restartArmTimer); restartArmTimer = null; }
+  if (btn && !btn.disabled) { btn.textContent = 'Restart broker'; btn.classList.remove('armed'); }
+}
+
+async function onRestartClick() {
+  const btn = $('restart-broker');
+  if (!btn) return;
+  if (!restartArmed) {
+    restartArmed = true;
+    btn.textContent = 'Confirm restart?';
+    btn.classList.add('armed');
+    if (restartArmTimer) clearTimeout(restartArmTimer);
+    restartArmTimer = setTimeout(() => disarmRestart(btn), 4000);
+    return;
+  }
+  // armed -> actually restart
+  disarmRestart(btn);
+  btn.disabled = true;
+  btn.textContent = 'Restarting…';
+  try {
+    const res = await fetch(api('/admin/restart'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders() },
+    });
+    if (res.status === 401) {
+      toast('err', 'operator key required to restart');
+    } else if (res.ok) {
+      toast('warn', 'Restarting the broker — on ECS the task is replaced (~10–30s). Reload the page shortly.');
+    } else {
+      const body = await res.json().catch(() => ({}));
+      toast('err', `✗ restart: ${body.error || `HTTP ${res.status}`}`);
+    }
+  } catch (e) {
+    toast('err', `✗ restart: ${e.message}`);
+  } finally {
+    // Re-enable after a short beat: on a real restart the socket drops and the poll will surface it
+    // anyway, but if the request failed (401/network) the operator should be able to retry.
+    setTimeout(() => {
+      const b = $('restart-broker');
+      if (b) { b.disabled = false; b.textContent = 'Restart broker'; b.classList.remove('armed'); }
+    }, 2000);
+  }
+}
+
+// Bind the restart button once at load (the button is static in index.html; only #config re-renders on
+// poll, so this listener survives). Out of an inline <script> for CSP.
+(function initRestartButton() {
+  const btn = $('restart-broker');
+  if (!btn) return;
+  btn.addEventListener('click', onRestartClick);
+})();
 
 function tierOf(k) {
   if (k.danger) return 'danger';
@@ -598,6 +683,165 @@ async function seedEvents() {
   } catch { /* gated/empty — the SSE stream will fill it */ }
 }
 
+// ---- Invites: node onboarding -----------------------------------------------
+// GET /admin/invites -> [{ id, label, uses, maxUses, revoked, createdAt, lastUsedAt, lastUsedBy }].
+// Returns [] when unauthed (operator-only). Every server value is escapeHtml'd at the interpolation
+// site (verify_c_repln.mjs §F): label/id/lastUsedBy are operator/worker supplied; the one-time token
+// from POST is server-generated (`inv_<hex>.<hex>`) but we escape it anyway — escaping is always safe.
+async function renderInvites() {
+  const data = await getJSON('/admin/invites'); // [] when unauthed (operator-only)
+  const rows = Array.isArray(data) ? data : data.invites || [];
+  const el = $('invites');
+  if (!rows.length) {
+    el.innerHTML = opKey()
+      ? `<div class="empty">no invites issued yet</div>`
+      : `<div class="empty">operator key required to manage invites</div>`;
+    return;
+  }
+  el.innerHTML = rows
+    .map((inv) => {
+      const max = inv.maxUses == null ? '∞' : escapeHtml(inv.maxUses);
+      const uses = `${escapeHtml(inv.uses ?? 0)}/${max}`;
+      const exhausted = inv.maxUses != null && Number(inv.uses) >= Number(inv.maxUses);
+      const last = inv.lastUsedAt
+        ? `last used ${escapeHtml(inv.lastUsedBy || '?')} · ${escapeHtml(new Date(inv.lastUsedAt).toLocaleString())}`
+        : 'never used';
+      const created = inv.createdAt ? `created ${escapeHtml(new Date(inv.createdAt).toLocaleString())}` : '';
+      const revokeBtn = inv.revoked
+        ? ''
+        : `<button class="inv-revoke" data-revoke="${escapeHtml(inv.id)}">Revoke</button>`;
+      return `<div class="invite ${inv.revoked ? 'revoked' : ''}">
+        <div class="inv-head">
+          <span class="inv-label">${escapeHtml(inv.label || '(no label)')}</span>
+          ${inv.revoked ? `<span class="inv-badge revoked">revoked</span>` : exhausted ? `<span class="inv-badge exhausted">exhausted</span>` : ''}
+          <span class="inv-uses">${uses}</span>
+          ${revokeBtn}
+        </div>
+        <div class="inv-meta">
+          <span class="inv-id">${escapeHtml(inv.id)}</span>
+          <span class="inv-last">${last}</span>
+          ${created ? `<span class="inv-created">${created}</span>` : ''}
+        </div>
+      </div>`;
+    })
+    .join('');
+
+  // wire per-invite revoke buttons -> POST /admin/invites/:id/revoke (auth) -> toast + re-render
+  el.querySelectorAll('[data-revoke]').forEach((btn) => {
+    btn.addEventListener('click', () => revokeInvite(btn.dataset.revoke, btn));
+  });
+}
+
+async function revokeInvite(id, btn) {
+  if (!id) return;
+  if (btn) { btn.disabled = true; btn.textContent = '…'; }
+  try {
+    const res = await fetch(api('/admin/invites/' + encodeURIComponent(id) + '/revoke'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders() },
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false || body.error) {
+      const msg = body.error || `HTTP ${res.status}`;
+      toast('err', `✗ revoke ${id}: ${msg}${res.status === 401 ? ' (set operator key)' : ''}`);
+    } else {
+      toast('ok', `✓ invite revoked · ${id}`);
+    }
+  } catch (e) {
+    toast('err', `✗ revoke ${id}: ${e.message}`);
+  } finally {
+    if (btn) { btn.disabled = false; btn.textContent = 'Revoke'; }
+    panel('invites', renderInvites);
+  }
+}
+
+// Issue a new invite -> POST /admin/invites (auth) { label, max_uses } -> { id, token, ... }. The
+// `token` is shown ONCE and is never retrievable again, so we reveal it prominently in a copyable box
+// with a one-time warning before re-rendering the list.
+async function issueInvite() {
+  const labelEl = $('inv-label');
+  const maxEl = $('inv-max');
+  const issueBtn = $('inv-issue');
+  const label = (labelEl ? labelEl.value : '').trim();
+  const maxRaw = (maxEl ? maxEl.value : '').trim();
+  const max_uses = maxRaw === '' ? null : Number(maxRaw);
+  if (max_uses != null && (!Number.isFinite(max_uses) || max_uses < 1)) {
+    toast('err', '✗ max uses must be a positive number (or blank for ∞)');
+    return;
+  }
+  if (issueBtn) { issueBtn.disabled = true; issueBtn.textContent = '…'; }
+  try {
+    const res = await fetch(api('/admin/invites'), {
+      method: 'POST',
+      headers: { 'content-type': 'application/json', ...authHeaders() },
+      body: JSON.stringify({ label, max_uses }),
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || body.ok === false || body.error || !body.token) {
+      const msg = body.error || (!body.token ? 'no token returned' : `HTTP ${res.status}`);
+      toast('err', `✗ issue invite: ${msg}${res.status === 401 ? ' (set operator key)' : ''}`);
+    } else {
+      revealToken(body);
+      toast('ok', `✓ invite issued · ${body.id}`);
+      if (labelEl) labelEl.value = '';
+      if (maxEl) maxEl.value = '';
+    }
+  } catch (e) {
+    toast('err', `✗ issue invite: ${e.message}`);
+  } finally {
+    if (issueBtn) { issueBtn.disabled = false; issueBtn.textContent = 'Issue invite'; }
+    panel('invites', renderInvites);
+  }
+}
+
+// Reveal the one-time token in a prominent, copyable box. The token is server-generated (`inv_<hex>.<hex>`)
+// but we escapeHtml it regardless — escaping a safe value is still correct. The box persists until the
+// operator dismisses it (it does NOT auto-clear on the 2s poll, since renderInvites only touches #invites).
+function revealToken(inv) {
+  const box = $('invite-reveal');
+  if (!box) return;
+  const token = String(inv.token ?? '');
+  const label = inv.label ? ` · ${escapeHtml(inv.label)}` : '';
+  box.innerHTML = `
+    <div class="reveal-warn">⚠ copy now — shown once, never retrievable again${label}</div>
+    <div class="reveal-row">
+      <code class="reveal-token" id="reveal-token">${escapeHtml(token)}</code>
+      <button class="reveal-copy" id="reveal-copy" type="button">Copy</button>
+      <button class="reveal-dismiss" id="reveal-dismiss" type="button" title="dismiss">✕</button>
+    </div>
+    <div class="reveal-sub">invite <span>${escapeHtml(inv.id)}</span> — paste into <code>molt worker join</code></div>`;
+  box.hidden = false;
+  const copyBtn = $('reveal-copy');
+  if (copyBtn) {
+    copyBtn.addEventListener('click', () => copyToken(token, copyBtn));
+  }
+  const dismissBtn = $('reveal-dismiss');
+  if (dismissBtn) {
+    dismissBtn.addEventListener('click', () => { box.hidden = true; box.innerHTML = ''; });
+  }
+}
+
+function copyToken(token, btn) {
+  const done = () => { if (btn) { btn.textContent = 'Copied ✓'; setTimeout(() => { btn.textContent = 'Copy'; }, 2000); } };
+  const fail = () => { toast('warn', 'clipboard blocked — select the token and copy manually'); };
+  if (navigator.clipboard && navigator.clipboard.writeText) {
+    navigator.clipboard.writeText(token).then(done, fail);
+  } else {
+    fail();
+  }
+}
+
+// Wire the "Issue invite" form (submit on button click or Enter). Out of the inline-script-free body for
+// CSP; bound once at load (the form element is static, only #invites re-renders on poll).
+(function initInviteForm() {
+  const form = $('invite-form');
+  if (!form) return;
+  form.addEventListener('submit', (e) => {
+    e.preventDefault();
+    issueInvite();
+  });
+})();
+
 // ---- Refresh loop -----------------------------------------------------------
 const renderConfigSafe = () => panel('config', renderConfig);
 
@@ -617,6 +861,7 @@ async function refresh() {
     panel('deliberations', renderDeliberations),
     panel('reputation', renderReputation),
     renderConfigSafe(),
+    panel('invites', renderInvites),
   ]);
 }
 

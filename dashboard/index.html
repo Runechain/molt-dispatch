@@ -60,7 +60,27 @@
       <!-- ===== CONTROL ===== -->
       <section class="panel span-3" id="panel-config">
         <h2>Control · runtime config</h2>
+        <!-- Restart bar: triggers POST /admin/restart (operator-only). The pending notice is populated
+             by renderConfig() each poll — it counts restart-tier knobs that hold a stored-but-not-applied
+             override, so the operator knows a restart is needed to make those 🟡 changes take effect. -->
+        <div class="restart-bar">
+          <span id="restart-pending" class="restart-pending" hidden></span>
+          <button id="restart-broker" class="restart-btn" type="button" title="restart the broker to apply pending restart-tier overrides">Restart broker</button>
+        </div>
         <div id="config" class="config"><div class="empty">…</div></div>
+      </section>
+
+      <!-- ===== INVITES — node onboarding ===== -->
+      <section class="panel span-3" id="panel-invites">
+        <h2>Invites — node onboarding</h2>
+        <form id="invite-form" class="invite-form" autocomplete="off">
+          <input id="inv-label" class="inv-input" type="text" placeholder="label — who/what this invite is for" spellcheck="false" />
+          <input id="inv-max" class="inv-input inv-max" type="number" min="1" step="1" placeholder="max uses (∞)" />
+          <button id="inv-issue" class="inv-issue" type="submit">Issue invite</button>
+        </form>
+        <!-- one-time token reveal: populated on a successful issue, otherwise empty -->
+        <div id="invite-reveal" class="invite-reveal" hidden></div>
+        <div id="invites" class="stack"><div class="empty">…</div></div>
       </section>
 
       <!-- ===== LIVE LOG ===== -->
