@@ -92,6 +92,7 @@ const ENV = {
   fuelReal: () => FUEL.real,
   requireIdentity: () => GAME.requireIdentity,
   auth: () => AUTH.enabled,
+  requireInvite: () => JOIN.requireInvite,
   // Presence-only: the panel shows whether the join gate is armed, NEVER the secret value itself.
   joinGate: () => (JOIN.secret ? 'set' : 'unset'),
 };
@@ -125,6 +126,10 @@ export const KNOBS = [
   { key: 'delibPremiumModel',  label: 'Premium (judge) model',       group: 'quorum',     envVar: 'MOLT_DELIB_PREMIUM_MODEL',     mutability: 'restart', danger: false, type: 'string', parse: parseString },
   { key: 'integrationAgent',   label: 'Integration agent enabled',   group: 'agents',     envVar: 'MOLT_INTEGRATION_AGENT',       mutability: 'restart', danger: false, type: 'bool',   parse: parseBool },
   { key: 'plannerAgent',       label: 'Planner agent enabled',       group: 'agents',     envVar: 'MOLT_PLANNER_AGENT',           mutability: 'restart', danger: false, type: 'bool',   parse: parseBool },
+  // Invite-only gate. Restart-tier (toggle in the panel + Restart to apply) so the operator controls
+  // it without a redeploy. ON = every registration needs a valid per-node invite (src/broker/invites.mjs)
+  // or the shared MOLT_JOIN_SECRET; layers on top of identity. Issue/revoke invites in the panel.
+  { key: 'requireInvite',      label: 'Require invite to join',      group: 'security',   envVar: 'MOLT_REQUIRE_INVITE',          mutability: 'restart', danger: false, type: 'bool',   parse: parseBool },
 
   // ---- deploy: infra wiring, never web-mutable ---------------------------------
   { key: 'port',               label: 'Broker port',                 group: 'network',    envVar: 'MOLT_PORT',                    mutability: 'deploy',  danger: false, type: 'number', parse: parseNumber },
