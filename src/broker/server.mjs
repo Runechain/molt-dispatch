@@ -716,13 +716,17 @@ function releaseObjective(objectiveId) {
   return { ok: true, objective_id: objectiveId, status: d.prepare('SELECT status FROM objectives WHERE id=?').get(objectiveId).status };
 }
 
-function listObjectives() {
+// List objectives, optionally scoped to a single creating account (createdBy = accounts.id). null/
+// undefined = no filter (the global operator view). The per-account filter is how a member's dashboard
+// shows only their own objectives without exposing the rest of the grid's work.
+function listObjectives(createdBy = null) {
   // Annotate with blocked_on — the operator's escape hatch when an objective is wedged behind
   // an upstream (never-approved, unresolved, or failed dependency). Empty array = not blocked.
-  return getDb()
-    .prepare('SELECT * FROM objectives ORDER BY created_at DESC')
-    .all()
-    .map((o) => ({ ...o, blocked_on: unsatisfiedDepsFor(o.id) }));
+  const d = getDb();
+  const rows = createdBy
+    ? d.prepare('SELECT * FROM objectives WHERE created_by=? ORDER BY created_at DESC').all(createdBy)
+    : d.prepare('SELECT * FROM objectives ORDER BY created_at DESC').all();
+  return rows.map((o) => ({ ...o, blocked_on: unsatisfiedDepsFor(o.id) }));
 }
 function listJobs(objectiveId) {
   const d = getDb();
@@ -932,22 +936,35 @@ async function serveStatic(req, res, urlPath) {
 // ---- Auth: team-gating via API keys ------------------------------------------
 // Keys are presented as `Authorization: Bearer <id>.<secret>`. Only the id and a sha256
 // of the secret are stored (api_keys table); the raw secret never persists.
-function authOk(req) {
+// Resolve the ACCOUNT behind a request's Bearer key, or null if the key is missing/invalid/revoked.
+// This is the per-tenant identity used to ATTRIBUTE new objectives (objectives.created_by) and to scope
+// the opt-in GET /objectives?mine=1 view to the caller's own work. `isOperator` (the key's scopes
+// include `admin`) is what lets a key target another account via ?account=<id>. The worker roster is
+// NOT scoped — workers are the shared compute pool, visible to everyone (the "centralized list of
+// workers"). Mirrors the old authOk lookup exactly (same constant-time-by-hash compare, same last_used
+// bump) so authOk can be a thin wrapper and every existing caller is byte-for-byte unchanged.
+function accountForReq(req) {
   const hdr = req.headers['authorization'] || '';
   const m = hdr.match(/^Bearer\s+(\S+)$/i);
-  if (!m) return false;
+  if (!m) return null;
   const dot = m[1].indexOf('.');
-  if (dot < 0) return false;
+  if (dot < 0) return null;
   const id = m[1].slice(0, dot);
   const secret = m[1].slice(dot + 1);
-  if (!id || !secret) return false;
+  if (!id || !secret) return null;
   const d = getDb();
   const row = d.prepare('SELECT * FROM api_keys WHERE id=? AND revoked=0').get(id);
-  if (!row) return false;
+  if (!row) return null;
   const hash = createHash('sha256').update(secret).digest('hex');
-  if (hash !== row.hash) return false;
+  if (hash !== row.hash) return null;
   d.prepare('UPDATE api_keys SET last_used=? WHERE id=?').run(now(), id);
-  return true;
+  const scopes = String(row.scopes || '').split(',').map((s) => s.trim()).filter(Boolean);
+  // `admin` scope = operator (sees all tenants). Everyone else is a member, scoped to their own work.
+  return { accountId: row.account_id, scopes, isOperator: scopes.includes('admin') };
+}
+
+function authOk(req) {
+  return !!accountForReq(req);
 }
 
 // Worker/contribution endpoints (/workers/*, /jobs/*) are open ONLY under the explicit opt-in
@@ -1074,7 +1091,12 @@ export function startBroker() {
       // MOLT_AUTH=1 gates mutating endpoints; with MOLT_OPEN_GRID=1 worker/job ingress is opened but
       // operator/spend endpoints (commission work, approve merges, credit/settle fuel) stay gated.
       // MOLT_AUTH unset/0 = fully open. Checked live.
-      const authed = process.env.MOLT_AUTH === '1' ? authOk(req) : true;
+      // Resolve the caller's account once (null when unauthed / auth disabled). `authed` keeps its
+      // boolean meaning for redaction; `account` carries the per-tenant identity for objective scoping
+      // and attribution. Computed even when MOLT_AUTH is off so a key sent to a local broker still
+      // attributes objectives to its account (harmless when there are no keys).
+      const account = accountForReq(req);
+      const authed = process.env.MOLT_AUTH === '1' ? !!account : true;
       if (process.env.MOLT_AUTH === '1' && requiresOperatorAuth(method, path) && !authed) {
         return json(res, 401, { error: 'unauthorized: operator endpoint — send Authorization: Bearer <api-key>' });
       }
@@ -1123,7 +1145,13 @@ export function startBroker() {
         const r = await submitResult(resultMatch[1], body);
         return json(res, r.code || 200, r);
       }
-      if (method === 'POST' && path === '/objectives') return json(res, 200, await createObjective(body));
+      if (method === 'POST' && path === '/objectives') {
+        // Attribute the objective to the creating account so it shows on THAT tenant's dashboard
+        // (and only theirs). An explicit body.created_by (e.g. github-issue import) wins; otherwise
+        // the authenticated account; otherwise the legacy 'cli' sentinel for keyless local use.
+        if (account?.accountId && body && body.created_by == null) body.created_by = account.accountId;
+        return json(res, 200, await createObjective(body));
+      }
       if (method === 'POST' && path === '/github/import-issues') {
         const r = await importIssues(body);
         return json(res, r.code || 200, r);
@@ -1182,7 +1210,20 @@ export function startBroker() {
       // projection (no prompts, absolute repo paths, raw contract/spec/payload JSON, provenance,
       // event stream). The authed view is unchanged. /health and the dashboard stay open.
       if (method === 'GET' && path === '/objectives') {
-        const objs = listObjectives();
+        // Per-tenant scoping is OPT-IN, so the legacy global view is unchanged (a bare GET still returns
+        // everything an authed caller could always see — operators, the bootstrap key, existing tooling):
+        //   * ?mine=1       -> just the caller's OWN objectives (how a per-user dashboard scopes itself);
+        //   * ?account=<id> -> that account's objectives, but ONLY for an operator key (admin scope); any
+        //                      other caller is narrowed to their own, so it can't read across tenants;
+        //   * no param      -> no filter (authed sees all; anon still gets the redacted projection below).
+        // A scoped request with no resolvable account uses a no-match sentinel, so it returns [], never all.
+        const mine = url.searchParams.get('mine') === '1';
+        const acctParam = url.searchParams.get('account');
+        const NOBODY = ' nobody'; // a created_by no row can hold -> scoped-but-unresolvable returns []
+        let createdBy = null; // null = no filter (legacy global view: authed sees all)
+        if (mine) createdBy = account ? account.accountId : NOBODY;
+        else if (acctParam) createdBy = account?.isOperator ? acctParam : (account ? account.accountId : NOBODY);
+        const objs = listObjectives(createdBy);
         return json(res, 200, authed ? objs : objs.map(redactObjective));
       }
       if (method === 'GET' && path === '/jobs') {
