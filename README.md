@@ -13,6 +13,16 @@ zero npm dependencies. Your AI subscriptions never leave your computer — each 
 drives a locally-authenticated CLI; the broker only ever sees jobs and artifacts.
 
 > Access to the live grid is **invite-only** — operators issue a join token to vetted nodes. Contact the team for access.
+>
+> Once you have a token, save it **once** and it persists for every future run:
+>
+> ```bash
+> molt worker join inv_xxxx.yyyy   # or run `molt worker join` and paste it when prompted
+> molt go                          # connects automatically using the saved token
+> ```
+>
+> `molt worker leave` forgets the saved token. (The token is stored locally in `.molt-join.json`,
+> gitignored, `0600` — same as your agent key. `MOLT_JOIN_SECRET` still works and overrides it.)
 
 ```
 objective  →  plan (job DAG)  →  worker claims  →  codex implements
