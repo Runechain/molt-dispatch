@@ -10,9 +10,10 @@
 import { mkdirSync, writeFileSync } from 'node:fs';
 import { join } from 'node:path';
 import { hostname } from 'node:os';
-import { BROKER, DEFAULTS, PATHS, AUTH, GAME, JOIN } from '../shared/config.mjs';
+import { BROKER, DEFAULTS, PATHS, AUTH, GAME } from '../shared/config.mjs';
 import { workerId as mkWorkerId } from '../shared/ids.mjs';
 import { loadOrCreateAgentKey, ensureClaimed } from './agent-identity.mjs';
+import { resolveJoinToken } from './join-credential.mjs';
 import { getAdapter, resolveAdapter, listAdapters, adapterMeta } from './adapters/index.mjs';
 import { preflightReport } from './preflight.mjs';
 
@@ -104,7 +105,11 @@ export async function startWorker(opts = {}) {
     max_slots: maxSlots,
     manifest,
     agent: agentKey ? agentKey.buildAuth() : undefined, // fresh-signed each attempt (bounds replay)
-    join_token: JOIN.secret || undefined, // operator-issued invite; broker rejects registration without it when set
+    // Operator-issued join credential, resolved FRESH each attempt: MOLT_JOIN_SECRET env first, else the
+    // token persisted by `molt worker join` (.molt-join.json). Re-reading per attempt means a worker that
+    // started before being joined picks up the token the moment the operator runs `molt worker join` —
+    // no restart needed. The broker rejects registration without it when the grid's join gate is on.
+    join_token: resolveJoinToken() || undefined,
   });
 
   // Register the worker, retrying durably through every failure mode. Reusable so the heartbeat /
@@ -116,7 +121,7 @@ export async function startWorker(opts = {}) {
   // return contract (callers only ever need the worker id).
   let lastRegister = null;
   async function register({ interactive = false } = {}) {
-    let attempt = 0, settling = false, staleWarned = false;
+    let attempt = 0, settling = false, staleWarned = false, joinHintShown = false;
     for (;;) {
       let reg;
       try {
@@ -159,6 +164,27 @@ export async function startWorker(opts = {}) {
         if (reg.error === 'claim was denied' || reg.error === 'agent_denied') {
           console.error('[worker] this agent was denied — exiting. Re-run to claim a fresh key.');
           process.exit(1);
+        }
+        // The grid's join gate rejected our token (missing / unknown / revoked / exhausted). This is the
+        // single most common onboarding failure, so make it ACTIONABLE instead of an opaque retry spin:
+        // tell the operator exactly what to run. We keep retrying (durable by default) because the token
+        // is re-read each attempt — running `molt worker join <token>` in another shell unblocks this
+        // process live, no restart. The hint prints once so the loop doesn't spam.
+        if (reg.error === 'join_denied') {
+          if (!joinHintShown) {
+            const had = !!resolveJoinToken();
+            console.error(
+              had
+                ? '[worker] join_denied — the broker rejected your join token (unknown, revoked, or used up).\n' +
+                    '         Get a fresh invite from the operator, then run:  molt worker join <token>'
+                : '[worker] join_denied — this grid is invite-only and no join token is set.\n' +
+                    '         Ask the operator for an invite (looks like inv_xxxx.yyyy), then run:  molt worker join <token>\n' +
+                    '         (waiting — once you join in another terminal, this worker connects automatically.)'
+            );
+            joinHintShown = true;
+          }
+          await sleep(backoff(attempt++, 2000, 15000));
+          continue;
         }
         // Unrecognized rejection — durable by default: back off and retry rather than crash.
         console.log(`[worker] registration rejected (${reg.error || 'unknown'}) — retrying…`);

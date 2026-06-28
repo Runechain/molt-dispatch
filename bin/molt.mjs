@@ -105,7 +105,19 @@ switch (cmd) {
         // capability is backed by an installed-but-unauthed tool. Default = warn-and-proceed.
         strict: !!flags.strict,
       });
+    } else if (sub === 'join') {
+      await joinCommand(rest);
+    } else if (sub === 'leave') {
+      const { clearJoinToken } = await import('../src/worker/join-credential.mjs');
+      const r = clearJoinToken();
+      console.log(r.cleared ? 'Forgot the saved join token. This node will register tokenless until you `molt worker join` again.'
+                            : 'No saved join token to forget.');
     } else usage();
+    break;
+
+  // Top-level alias so the very first thing a new operator types just works:  molt join <token>
+  case 'join':
+    await joinCommand([sub, ...rest].filter((x) => x != null));
     break;
 
   // One command to join the LIVE grid. Zero config — sensible prod defaults baked in; you only
@@ -429,15 +441,58 @@ switch (cmd) {
     usage();
 }
 
+// `molt worker join [token]` / `molt join [token]` — persist the operator-issued join token ONCE so
+// every later `molt go` / `molt worker start` registers with it automatically (no env var, no re-paste).
+// With no token argument it prompts interactively ("run molt worker join, then enter this key"); the
+// token is also accepted on the command line for scripted onboarding. `--show` prints whether one is
+// saved (never the token itself); `--clear` forgets it (same as `molt worker leave`).
+async function joinCommand(args) {
+  const { flags, positional } = parseFlags(args);
+  const cred = await import('../src/worker/join-credential.mjs');
+
+  if (flags.clear) {
+    const r = cred.clearJoinToken();
+    console.log(r.cleared ? 'Forgot the saved join token.' : 'No saved join token to forget.');
+    return;
+  }
+  if (flags.show) {
+    console.log(cred.loadJoinToken() ? `A join token is saved at ${cred.joinCredentialPath()}.`
+                                     : 'No join token saved yet — run: molt worker join <token>');
+    return;
+  }
+
+  let token = positional[0];
+  if (!token) {
+    // Interactive prompt — the path the operator described ("run molt worker join and then enter this key").
+    const { createInterface } = await import('node:readline');
+    const rl = createInterface({ input: process.stdin, output: process.stdout });
+    token = await new Promise((r) => rl.question('Paste your join token (looks like inv_xxxx.yyyy): ', (a) => { rl.close(); r(a); }));
+  }
+  if (!cred.normalizeToken(token)) {
+    console.error('No token entered. Get an invite from the operator, then run:  molt worker join <token>');
+    process.exit(1);
+  }
+  try {
+    const path = cred.saveJoinToken(token);
+    console.log(`Saved your join token to ${path} (this machine only).`);
+    console.log('You can now join the grid:  molt go    (or: molt worker start)');
+  } catch (e) {
+    console.error(`Could not save the join token: ${e.message}`);
+    process.exit(1);
+  }
+}
+
 function usage() {
   console.log(`molt — Distributed Agent Compute Grid  v${version()}
 
+  molt join <token>                  save the operator-issued join token once (persists; or: molt worker join)
   molt go                            join the LIVE grid as an agent (zero config; claim once, then it works)
   molt stop                          stop the running agent
   molt logs [--key <operator-key>]   live-tail the grid event stream (what's happening, as it happens)
 
   molt doctor
   molt broker start                  (set MOLT_AUTH=1 to require API keys)
+  molt worker join [token]           save the join token (prompts if omitted)   |   molt worker leave   (forget it)
   molt worker start [--adapters mock,codex,claude,local,bedrock] [--owner NAME] [--max-slots N] [--trust N] [--strict]
   molt infer "<prompt>" [--title T] [--adapter local|bedrock]
   molt result <objective-id>         (print inference completions)
