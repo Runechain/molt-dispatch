@@ -107,14 +107,14 @@ jobs:
             --query 'taskDefinition.taskDefinitionArn' --output text)
           echo "Registered task definition: $TD_ARN"
 
-          # Check if the service exists
-          STATUS=$(aws ecs describe-services \
+          # Check if the service exists (missing service returns "None")
+          SERVICE_ARN=$(aws ecs describe-services \
             --cluster  $ECS_CLUSTER \
             --services $ECS_SERVICE \
-            --query 'services[0].status' --output text 2>/dev/null || echo "NONE")
+            --query 'services[0].serviceArn' --output text 2>/dev/null || echo "None")
 
-          if [ "$STATUS" = "ACTIVE" ]; then
-            echo "Service active — updating task definition..."
+          if [ "$SERVICE_ARN" != "None" ]; then
+            echo "Service exists — updating task definition..."
             aws ecs update-service \
               --cluster        $ECS_CLUSTER \
               --service        $ECS_SERVICE \
