@@ -19,6 +19,7 @@ import { codexAdapter } from './codex.mjs';
 import { claudeAdapter } from './claude.mjs';
 import { hermesAdapter } from './hermes.mjs';
 import { openaiCompatibleAdapter } from '../providers/openai-compatible.mjs';
+import { apikeyAdapter } from '../providers/apikey.mjs';
 import { bedrockAdapter } from '../providers/bedrock.mjs';
 import { deepseekAdapter } from '../providers/deepseek.mjs';
 
@@ -28,6 +29,7 @@ const ALL = {
   claude: claudeAdapter,
   hermes: hermesAdapter,
   local: openaiCompatibleAdapter, // OpenAI-compatible endpoint (Ollama/vLLM/llama.cpp) — local Qwen, etc.
+  apikey: apikeyAdapter,          // BYO API key (OpenAI, Together, Mistral) — inference.mid capability
   bedrock: bedrockAdapter, // AWS Bedrock — the funded continuation backstop
   deepseek: deepseekAdapter, // DeepSeek API (deepseek-chat / deepseek-reasoner), billed via DEEPSEEK_API_KEY
 };

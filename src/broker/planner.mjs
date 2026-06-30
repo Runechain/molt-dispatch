@@ -12,15 +12,7 @@ import { extractJson } from '../shared/jsonout.mjs';
 import { PLAN_SCHEMA, validateAgainst } from '../shared/schema.mjs';
 import { fenceUntrusted, sanitizeTitle } from '../shared/prompt-safety.mjs';
 import { decomposeWithAgent } from './agents/planner-agent.mjs';
-
-// Capabilities the grid can currently schedule, and which adapter serves each.
-const CAPABILITIES = {
-  'code.implementation': 'codex',
-  'tests.unit': 'codex',
-  'code.review': 'claude',
-  'docs.technical': 'claude',
-  'product.specification': 'claude',
-};
+import { PLANNER_CAPABILITIES } from '../../lib/registry.js';
 
 export async function planObjective(objective) {
   const mode = objective.contract?.planner || 'template';
@@ -168,7 +160,7 @@ export function mapPlannedJobs(planJobs, contract = {}) {
   // get materialized. Otherwise a job whose dependency was dropped (unschedulable capability /
   // past the 8-cap) is born 'blocked' with no job_dependencies row — an orphan that never
   // unblocks and wedges finalizeObjective.
-  const kept = planJobs.slice(0, 8).filter((j) => CAPABILITIES[j.capability]);
+  const kept = planJobs.slice(0, 8).filter((j) => PLANNER_CAPABILITIES[j.capability]);
   const keptKeys = new Set(kept.map((j) => j.key));
   const planned = kept.map((j) => {
     const isImpl = j.capability === 'code.implementation' || j.capability === 'tests.unit';
@@ -177,7 +169,7 @@ export function mapPlannedJobs(planJobs, contract = {}) {
       type: j.type || (isImpl ? 'code.implementation' : 'code.review'),
       title: j.title,
       capability: j.capability,
-      adapter_hint: CAPABILITIES[j.capability],
+      adapter_hint: PLANNER_CAPABILITIES[j.capability],
       prompt: j.prompt || j.title,
       spec: isImpl ? implSpec(contract) : { rubric: j.capability === 'code.review' },
       depends_on: (j.depends_on || []).filter((k) => keptKeys.has(k)),
@@ -187,7 +179,7 @@ export function mapPlannedJobs(planJobs, contract = {}) {
 }
 
 function plannerPrompt(objective) {
-  const caps = Object.entries(CAPABILITIES).map(([c, a]) => `  - ${c} (adapter: ${a})`).join('\n');
+  const caps = Object.entries(PLANNER_CAPABILITIES).map(([c, a]) => `  - ${c} (adapter: ${a})`).join('\n');
   return [
     `Decompose this objective into a SMALL dependency graph (2-5) of bounded work units.`,
     `\nObjective: "${sanitizeTitle(objective.title)}"`,
@@ -206,6 +198,10 @@ function plannerPrompt(objective) {
 }
 
 // ---- Materialize plan -> jobs + dependencies ---------------------------------
+
+// Maps leaf-task complexity_tier to a registered capability so the scheduler can
+// route S2 generation work to the right inference pool without manual overrides.
+const TIER_CAP = Object.freeze({ local: 'inference.local', mid: 'inference.mid', frontier: 'inference.frontier' });
 
 function materialize(objective, planned) {
   const d = getDb();
@@ -234,7 +230,7 @@ function materialize(objective, planned) {
         type: p.type,
         title: p.title,
         prompt: p.prompt,
-        capability_required: p.capability,
+        capability_required: p.capability || (TIER_CAP[p.complexity_tier]) || null,
         trust_required: p.trust_required ?? 0,
         adapter_hint: p.adapter_hint,
         spec_json: JSON.stringify(p.spec || {}),

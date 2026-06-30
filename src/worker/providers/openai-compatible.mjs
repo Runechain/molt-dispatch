@@ -27,7 +27,7 @@ export const openaiCompatibleAdapter = {
   kind: 'provider',
   provider: 'local',
   model: MODEL,
-  capabilities: ['inference'],
+  capabilities: ['inference', 'inference.local'],
 
   async detect() {
     try {
@@ -43,7 +43,12 @@ export const openaiCompatibleAdapter = {
     if (prior) ctx.log(`[local:${MODEL}] resuming from ${prior.length} chars of partial output`);
     else ctx.log(`[local:${MODEL}] generating...`);
 
-    const messages = [{ role: 'system', content: 'You complete the task. Output only the result.' }];
+    const spec = typeof job.spec_json === 'string' ? JSON.parse(job.spec_json || '{}') : (job.spec_json || {});
+    const seedClause = spec.entropy_seed
+      ? `\n\nGeneration seed (hex): ${spec.entropy_seed}. Let this seed influence the texture, names, and flavour of your output without referencing it literally.`
+      : '';
+    const maxTok = spec.max_tokens || MAX_TOKENS;
+    const messages = [{ role: 'system', content: 'You complete the task. Output only the result.' + seedClause }];
     messages.push({ role: 'user', content: job.prompt || job.title || '' });
     // Resume: the partial came from a PRIOR (possibly different, possibly hostile) worker, so it is
     // replayed as fenced UNTRUSTED data — never as a trusted assistant turn that could carry an
@@ -58,7 +63,7 @@ export const openaiCompatibleAdapter = {
       const res = await fetch(`${BASE}/chat/completions`, {
         method: 'POST',
         headers: authHeaders(),
-        body: JSON.stringify({ model: MODEL, messages, max_tokens: MAX_TOKENS, stream: true }),
+        body: JSON.stringify({ model: MODEL, messages, max_tokens: maxTok, stream: true }),
         signal: ctx.signal,
       });
       if (!res.ok || !res.body) {
