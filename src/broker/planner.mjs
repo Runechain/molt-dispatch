@@ -13,6 +13,7 @@ import { PLAN_SCHEMA, validateAgainst } from '../shared/schema.mjs';
 import { fenceUntrusted, sanitizeTitle } from '../shared/prompt-safety.mjs';
 import { decomposeWithAgent } from './agents/planner-agent.mjs';
 import { PLANNER_CAPABILITIES } from '../../lib/registry.js';
+import { validateDecomp } from './decomp-validator.mjs';
 
 export async function planObjective(objective) {
   const mode = objective.contract?.planner || 'template';
@@ -34,6 +35,19 @@ export async function planObjective(objective) {
   } else {
     planned = templatePlan(objective);
   }
+
+  // Quality gate: validate the decomposition before committing jobs to the DB.
+  const qv = validateDecomp(planned, { objectiveId: objective.id });
+  for (const w of qv.warnings) logEvent('objective', objective.id, 'decomp_warning', { message: w });
+  if (!qv.valid) {
+    logEvent('objective', objective.id, 'decomp_invalid', { errors: qv.errors });
+    // Fall back to the template plan rather than materializing a broken DAG.
+    if (mode !== 'template') {
+      logEvent('objective', objective.id, 'planner_fallback', { reason: 'decomp validation failed; using template' });
+      planned = templatePlan(objective);
+    }
+  }
+
   return materialize(objective, planned);
 }
 

@@ -521,8 +521,9 @@ async function submitResult(jobId, body) {
     return { error: 'invalid or expired lease', code: 409 };
   }
 
-  // mark completed + free the worker slot
-  d.prepare('UPDATE jobs SET status=?, updated_at=? WHERE id=?').run('completed', now(), jobId);
+  // mark completed + persist result
+  const { lease_token: _lt, artifacts: _af, ...resultData } = body;
+  d.prepare('UPDATE jobs SET status=?, result_json=?, updated_at=? WHERE id=?').run('completed', JSON.stringify(resultData), now(), jobId);
   if (job.assigned_worker_id) {
     d.prepare('UPDATE workers SET active_slots = MAX(0, active_slots - 1) WHERE id=?').run(job.assigned_worker_id);
   }
@@ -553,6 +554,25 @@ async function submitResult(jobId, body) {
     logEvent('job', jobId, 'seat_result', { panel_id: job.panel_id, seat_role: job.seat_role });
   }
   logEvent('job', jobId, 'result_submitted', { status: body.status });
+
+  // S2 pipeline: when an inference job with s2_type completes successfully, auto-create
+  // a validation job that checks output structure and ingests approved content.
+  if (body.status === 'completed' && body.output) {
+    try {
+      const spec = typeof job.spec_json === 'string' ? JSON.parse(job.spec_json || '{}') : (job.spec_json || {});
+      if (spec.s2_type) {
+        const vId = mkJobId(nextSeq('job'));
+        d.prepare(`INSERT INTO jobs(id,objective_id,job_key,type,title,prompt,capability_required,trust_required,adapter_hint,spec_json,status,priority,estimated_minutes,attempts,created_at,updated_at)
+                   VALUES(?,?,?,?,?,?,?,0,?,?,?,200,2,0,?,?)`)
+         .run(vId, job.objective_id, `${job.job_key}-s2validate`, 's2.validate',
+              `Validate S2 ${spec.s2_type} for ${spec.s2_area || 'unknown'}`,
+              body.output, 's2.validate', 's2-validator',
+              JSON.stringify({ s2_type: spec.s2_type, s2_area: spec.s2_area, entropy_seed: spec.entropy_seed, ingest_url: process.env.GAME_INGEST_URL || '' }),
+              'pending', now(), now());
+        logEvent('job', vId, 'created', { kind: 's2_validation', parent: jobId, s2_type: spec.s2_type });
+      }
+    } catch (_) { /* non-critical — don't fail result submission if validation job creation errors */ }
+  }
 
   const ctx = await buildResultCtx(job);
   const verdict = await onResult(jobId, body, ctx);
@@ -729,10 +749,14 @@ function listJobs(objectiveId) {
   const rows = objectiveId
     ? d.prepare('SELECT * FROM jobs WHERE objective_id=? ORDER BY created_at ASC').all(objectiveId)
     : d.prepare('SELECT * FROM jobs ORDER BY created_at ASC').all();
-  return rows.map((j) => ({
-    ...j,
-    depends_on: d.prepare('SELECT depends_on_job_id FROM job_dependencies WHERE job_id=?').all(j.id).map((r) => r.depends_on_job_id),
-  }));
+  return rows.map((j) => {
+    const { result_json, ...rest } = j;
+    return {
+      ...rest,
+      result: result_json ? JSON.parse(result_json) : null,
+      depends_on: d.prepare('SELECT depends_on_job_id FROM job_dependencies WHERE job_id=?').all(j.id).map((r) => r.depends_on_job_id),
+    };
+  });
 }
 function listWorkers() {
   // Liveness is DERIVED from the heartbeat we already collect (every heartbeatSeconds), never from
@@ -763,7 +787,7 @@ function redactObjective(o) {
   return { ...rest, repo: repo ? '<redacted>' : null };
 }
 function redactJob(j) {
-  const { prompt, spec_json, contract_json, payload_json, last_failed_worker_id, ...rest } = j;
+  const { prompt, spec_json, contract_json, payload_json, last_failed_worker_id, result, ...rest } = j;
   return rest;
 }
 function redactFuelEntry(e) {
@@ -1147,35 +1171,80 @@ export function startBroker() {
       if (method === 'POST' && path === '/payments/verify') { const r = await postPaymentsVerify(body); return json(res, r.code || 200, r); }
       if (method === 'POST' && path === '/payments/request') { const r = postPaymentsRequest(body); return json(res, r.code || 200, r); }
 
-      // Open onboarding (no auth). Any agent — human or AI — that hits the grid can learn how to
-      // JOIN, and crucially that a WORKER does NOT need an operator/API key. This is the discovery
-      // surface so contributors stop pattern-matching on the operator flow and assuming they need a key.
-      if (method === 'GET' && (path === '/help' || path === '/connect')) {
-        // The join recipe is operator-only: an anonymous passerby hitting the live broker gets a terse,
-        // non-instructive reply. Authed operators get the full how-to so they can onboard invited nodes.
-        // The real lock is the join token (registerWorker rejects without it when MOLT_JOIN_SECRET is
-        // set); this endpoint gating is the obscurity layer that stops advertising the flow.
-        if (!authed) {
+      // ── Join: open onboarding ──
+      // GET /join         → no token needed. Agents get JSON with the run command. Browsers get
+      //                     a self-contained .command file (macOS: double-click → Terminal runs it).
+      // GET /join/<token> → same, but bakes the invite token into the install for gated brokers.
+      // No landing page, no key generation, no ceremony. The URL IS the onboarding.
+      if (method === 'GET' && (path === '/join' || path.startsWith('/join/'))) {
+        const joinToken = path.length > 6 ? path.slice(6).split('/')[0] : '';
+        const repo = 'https://github.com/water-bear86/molt-dispatch.git';
+        const brokerUrl = BROKER.url;
+
+        const tokenSteps = joinToken
+          ? [`printf '%s\\n' '${joinToken}' > ~/.molt/.molt-token && chmod 600 ~/.molt/.molt-token`]
+          : [];
+        const runSteps = [
+          `git clone --depth 1 ${repo} ~/.molt 2>/dev/null || git -C ~/.molt pull --ff-only --quiet`,
+          ...tokenSteps,
+          `MOLT_BROKER_URL=${brokerUrl} node ~/.molt/bin/molt.mjs go`,
+        ];
+
+        // Agents (Claude Code, Codex, curl) get JSON they can run directly.
+        const accept = req.headers.accept || '';
+        if (accept.includes('application/json') || accept.includes('text/plain') || !accept.includes('text/html')) {
           return json(res, 200, {
-            service: 'RUNECHAIN molt — distributed agent compute grid',
-            access: 'invite-only — joining requires a token issued by the operator. Contact the team for access.',
+            service: 'molt — distributed agent compute grid',
+            action: 'Run the commands below to join.',
+            broker: brokerUrl,
+            prereqs: 'Node >= 24, git, and an inference provider (Claude Code CLI or DEEPSEEK_API_KEY)',
+            run: runSteps,
+            run_oneliner: runSteps.join(' && '),
           });
         }
-        return json(res, 200, {
-          service: 'RUNECHAIN molt — distributed agent compute grid',
-          you_are: 'a WORKER (agent): you PULL and run work. You do NOT commission it.',
-          need_api_key: false,
-          join_token_required: !!JOIN.secret,
-          how_to_join: [
-            'Obtain a join token from the operator and set MOLT_JOIN_SECRET in your environment.',
-            'node bin/molt.mjs go',
-            'On first run it auto-generates your ed25519 identity key (you never see or paste it) and prints a one-time claim link.',
-            'A human opens the link and confirms it (Google sign-in) — binding your agent to their RUNECHAIN account.',
-            'You are online: you pull jobs, run them with a locally-authenticated adapter, and your reputation + earnings accrue to that account.',
-          ],
-          do_NOT: 'Do not obtain or use an operator/API key. Workers authenticate by CLAIM + join token, not by operator key.',
-          adapters: 'mock, codex, claude, local, deepseek, bedrock — the worker keeps whichever it can detect locally',
+
+        // Browsers get a self-contained .command file — no landing page, no second fetch.
+        const tokenBash = joinToken
+          ? `\nprintf '%s\\n' "${joinToken}" > "$MOLT_HOME/.molt-token"\nchmod 600 "$MOLT_HOME/.molt-token"\necho "  ✓ token saved"`
+          : '';
+        const script = `#!/bin/bash
+# molt — join the distributed agent compute grid
+set -euo pipefail
+clear
+G="\\033[32m"; D="\\033[0m"; R="\\033[31m"
+echo ""
+echo "  \${G}▰▰▱\${D}  molt — joining the grid"
+echo ""
+MOLT_HOME="\${MOLT_HOME:-$HOME/.molt}"
+REPO="${repo}"
+
+# prereqs
+if ! command -v node &>/dev/null; then echo "  \${R}✗\${D} Node.js not found — install Node >= 24: https://nodejs.org" >&2; echo ""; read -rsp "press any key..."; exit 1; fi
+NV=$(node -e 'process.stdout.write(process.versions.node.split(".")[0])')
+if [ "$NV" -lt 24 ]; then echo "  \${R}✗\${D} Node $NV found — need >= 24: https://nodejs.org" >&2; echo ""; read -rsp "press any key..."; exit 1; fi
+echo "  ✓ node $NV"
+if ! command -v git &>/dev/null; then echo "  \${R}✗\${D} git not found" >&2; echo ""; read -rsp "press any key..."; exit 1; fi
+echo "  ✓ git"
+
+# install / update
+if [ -d "$MOLT_HOME/.git" ]; then
+  echo "  ↻ updating"; git -C "$MOLT_HOME" pull --ff-only --quiet 2>/dev/null || true
+else
+  echo "  ↓ installing"; git clone --depth 1 --quiet "$REPO" "$MOLT_HOME"
+fi
+${tokenBash}
+echo "  ✓ ready"
+echo ""
+
+# join
+export MOLT_BROKER_URL="${brokerUrl}"
+exec node "$MOLT_HOME/bin/molt.mjs" go
+`;
+        res.writeHead(200, {
+          'content-type': 'application/octet-stream',
+          'content-disposition': 'attachment; filename="join-molt.command"',
         });
+        return res.end(script);
       }
 
       // Read endpoints. When auth is enforced and the caller is unauthed, return a REDACTED
