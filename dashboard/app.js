@@ -202,6 +202,39 @@ async function renderQueue() {
     .join('');
 }
 
+// ---- Objectives (per-tenant) ------------------------------------------------
+// "Everyone gets their own dashboard": when a key is set we ask for ?mine=1 so the broker scopes the
+// list to the caller's account (a member only ever sees their own; an operator sees their own here and
+// the whole grid via the other panels). With NO key (local single-user broker) we ask for all — the
+// legacy behavior. Workers stay global (rendered separately) — they're the shared compute pool.
+async function renderObjectives() {
+  const scoped = !!opKey();
+  const data = await getJSON(scoped ? '/objectives?mine=1' : '/objectives');
+  const objs = Array.isArray(data) ? data : [];
+  const scopeEl = $('obj-scope');
+  if (scopeEl) scopeEl.textContent = scoped ? '· yours' : '· all (local)';
+  const el = $('objectives');
+  if (!objs.length) {
+    el.innerHTML = scoped
+      ? `<div class="empty">no objectives yet — molt objective create "…"</div>`
+      : `<div class="empty">no objectives yet</div>`;
+    return;
+  }
+  el.innerHTML = objs
+    .map((o) => {
+      const blocked = Array.isArray(o.blocked_on) && o.blocked_on.length;
+      const pr = o.pr_url ? `<a class="obj-pr" href="${escapeHtml(o.pr_url)}" target="_blank" rel="noopener">PR ↗</a>` : '';
+      return `<div class="obj-row">
+        <span class="obj-id">${escapeHtml(o.id)}</span>
+        ${badge(o.status)}
+        <span class="obj-title">${escapeHtml(o.title || '')}</span>
+        ${blocked ? `<span class="tag">blocked</span>` : ''}
+        ${pr}
+      </div>`;
+    })
+    .join('');
+}
+
 // ---- Workers ----------------------------------------------------------------
 async function renderWorkers() {
   const workers = await getJSON('/workers');
@@ -856,6 +889,7 @@ async function refresh() {
   }
   await Promise.all([
     panel('summary', renderSummary),
+    panel('objectives', renderObjectives),
     panel('queue', renderQueue),
     panel('workers', renderWorkers),
     panel('deliberations', renderDeliberations),
