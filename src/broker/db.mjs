@@ -47,6 +47,9 @@ function migrate(d) {
   // each seat as an independent inference job and panel_id exists ONLY for the independence rule.
   addCol('jobs', 'panel_id', 'panel_id TEXT');
   addCol('jobs', 'seat_role', 'seat_role TEXT');
+  // S2 pipeline: persist the worker-submitted result payload so the dashboard, validator jobs,
+  // and the ingest hook can read it. NULL for every non-S2 and pre-existing job — additive only.
+  addCol('jobs', 'result_json', 'result_json TEXT');
   // Per-node invites (src/broker/invites.mjs). Which invite a worker joined with — NULL for every
   // worker that joined via the shared MOLT_JOIN_SECRET or an ungated grid, so pre-existing rows and
   // every legacy register flow are untouched. Added additively so an old DB picks it up on next open.
